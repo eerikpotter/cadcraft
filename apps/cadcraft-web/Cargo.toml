@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+icp-cloud = ["dep:sovereign-cloud-ui"]
+
 [lints]
 workspace = true
 
@@ -14,6 +17,7 @@ name = "cadcraft-web"
 path = "src/main.rs"
 
 [dependencies]
+sovereign-cloud-ui = { path = "../../vendor/sovereign-cloud-ui", optional = true }
 cadcraft-engine = { workspace = true }
 cadcraft-ui-egui = { workspace = true }
 cadcraft-io = { workspace = true }

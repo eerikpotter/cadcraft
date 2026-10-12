@@ -454,6 +454,11 @@ pub fn menu_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                         for e in entries {
                             entry_ui(ui, e, &mut clicked);
                         }
+                        if *name == "File"
+                            && let Some(menu) = &app.file_menu
+                        {
+                            menu(ui, app.session.state().is_ok());
+                        }
                     });
                 }
             });

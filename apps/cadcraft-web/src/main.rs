@@ -6,6 +6,9 @@
 //! drawing. Saving downloads the drawing through the browser (`download.rs`).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(feature = "icp-cloud")]
+mod cloud;
+
 #[cfg(target_arch = "wasm32")]
 pub mod download;
 
@@ -19,13 +22,23 @@ mod web {
     const LOADING_ID: &str = "cadcraft_loading";
 
     /// The app, and the files File > Open… and drag and drop read for it in the background.
-    struct Shell(CadApp, crate::upload::Inbox);
+    struct Shell(CadApp, crate::upload::Inbox, #[cfg(feature = "icp-cloud")] sovereign_cloud_ui::Cloud);
+
+    fn publish_dirty_state(dirty: bool) {
+        if let Some(root) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.document_element()) {
+            let value = if dirty { "true" } else { "false" };
+            if root.get_attribute("data-craft-dirty").as_deref() != Some(value) {
+                let _ = root.set_attribute("data-craft-dirty", value);
+            }
+        }
+    }
 
     impl eframe::App for Shell {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.1.take_dropped(ctx);
             self.1.drain(&mut self.0);
             self.0.logic(ctx);
+            publish_dirty_state(self.0.session.docs.iter().any(|d| d.is_dirty()));
         }
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
             self.0.raw_input_hook(raw);
@@ -40,6 +53,9 @@ mod web {
         }
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             self.0.ui(ui);
+            #[cfg(feature = "icp-cloud")]
+            self.2.ui(ui.ctx(), &mut crate::cloud::Adapter(&mut self.0));
+            publish_dirty_state(self.0.session.docs.iter().any(|d| d.is_dirty()));
         }
     }
 
@@ -102,7 +118,19 @@ mod web {
                             picker.pick();
                             None
                         }));
-                        Ok(Box::new(Shell(app, inbox)))
+                        #[cfg(feature = "icp-cloud")]
+                        let cloud = {
+                            let cloud = sovereign_cloud_ui::Cloud::new(sovereign_cloud_ui::AppSpec::CAD, cc.egui_ctx.clone());
+                            let menu = cloud.menu_handle();
+                            app.file_menu = Some(Box::new(move |ui, has_doc| menu.ui(ui, has_doc)));
+                            cloud
+                        };
+                        Ok(Box::new(Shell(
+                            app,
+                            inbox,
+                            #[cfg(feature = "icp-cloud")]
+                            cloud,
+                        )))
                     }),
                 )
                 .await;

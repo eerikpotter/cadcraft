@@ -165,6 +165,9 @@ pub struct Services {
 }
 
 pub struct CadApp {
+    /// Optional browser-host extension to the File menu.
+    pub file_menu: Option<Box<dyn Fn(&mut egui::Ui, bool)>>,
+
     pub system_languages: Vec<String>,
     pub session: Session,
     pub ui: UiState,
@@ -202,6 +205,7 @@ pub struct CadApp {
 impl CadApp {
     pub fn new(session: Session, services: Services) -> Self {
         CadApp {
+            file_menu: None,
             system_languages: Vec::new(),
             session,
             ui: UiState::default(),

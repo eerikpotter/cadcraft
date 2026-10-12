@@ -57,3 +57,5 @@ Generated-in-code assets are original and have no file to list:
 | Asset | Author | Source | Licence | Notes |
 |---|---|---|---|---|
 | `crates/ui-egui/src/i18n/uk.tsv` | @dmatviichuk | Original Ukrainian translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied |
+
+| `vendor/sovereign-cloud-ui/assets/icp/logo.svg` | DFINITY Foundation | [Developer documentation, pinned source](https://github.com/dfinity/developer-docs/blob/2e48927666fb50d15a5c874aca4b64f50e584708/public/favicon.svg) | Apache-2.0 (adjacent LICENSE) | Shared cloud UI integration mark |

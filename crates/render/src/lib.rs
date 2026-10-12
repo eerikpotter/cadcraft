@@ -13,10 +13,13 @@ mod fill;
 mod hatch;
 mod linetype;
 mod linetype_text;
+mod mline;
 pub mod paper;
+pub mod pen;
 mod plotstyle;
 mod point;
 pub mod raster;
+mod text;
 mod tolerance;
 pub mod units;
 mod wide;
@@ -24,15 +27,20 @@ mod wide;
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Lineweight, Prim, Space};
 use cadcraft_geom::{Bounds2, Mat3, Polyline, Vec2};
+use pen::Pen;
 
 pub use dim::{ArrowGeom, Arrowhead, DimGeometry, DimText, LineRole, arrowhead, dimension_geometry, dimension_geometry_with, format_linear_value};
 pub use fill::triangulate_evenodd;
+pub use hatch::pattern_swatch;
 pub use paper::{PAPER_SIZES, PaperSize, Sheet, paper_size, sheet};
 pub use tolerance::{gdt_points, tolerance_in};
 
 /// Handle carried by model-space geometry drawn inside a paper-space viewport (it belongs to no
 /// single paper-space entity, so selection highlighting never matches it).
 pub const VIEWPORT_CONTENT: Handle = Handle(0);
+
+/// [`DisplayList::prim_layers`] of a primitive whose layer isn't in the layer table.
+pub const NO_LAYER: u32 = u32::MAX;
 
 /// What a display-list primitive draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,12 +78,44 @@ pub struct DisplayList {
     pub prims: Vec<DPrim>,
     pub verts: Vec<Vec2>,
     pub tris: Vec<Vec2>,
+    /// Plots ([`build_plot`]): for each primitive, the index in [`Drawing::layers`] of the layer
+    /// it is drawn on (block contents on layer 0: the block reference's; [`NO_LAYER`] when the
+    /// layer isn't in the table), for PDF layers. Empty for other lists.
+    pub prim_layers: Vec<u32>,
+    /// Plots: outline-font glyphs that a plotter can write as text instead of drawing the
+    /// filled outline primitive they stand for ([`PlotText::prim`]), in drawing order.
+    pub texts: Vec<PlotText>,
     pub bounds: Bounds2,
     /// The paper sheet when the list was built for a layout (paper space); the UI draws the
     /// white sheet, its shadow and the printable-area outline from it.
     pub sheet: Option<Sheet>,
     /// Block contents expanded while building (see [`MAX_BLOCK_EXPANSION`]).
     pub expanded: usize,
+    /// Plot style end, join and fill style per primitive (parallel to `prims`; missing entries
+    /// are "use object"), turned into geometry by [`pen::apply`].
+    pub pens: Vec<Pen>,
+}
+
+/// A glyph of plotted text: the font glyph and, in world coordinates, where it sits. It is
+/// drawn by primitive [`PlotText::prim`] (a filled outline in the primitive's colour); output
+/// with real text writes the glyph instead of that primitive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlotText {
+    /// The filled outline primitive (index in [`DisplayList::prims`]); [`PlotText::NONE`] when
+    /// the glyph has none in the list (clipped by a viewport).
+    pub prim: u32,
+    /// Triangle vertices of the outline when it was drawn, and their bounding box (a clipped
+    /// outline has others).
+    pub verts: u32,
+    pub bounds: Bounds2,
+    /// The glyph; its origin and em axes are in world coordinates.
+    pub glyph: cadcraft_fonts::TextGlyph,
+}
+
+impl PlotText {
+    pub const NONE: u32 = u32::MAX;
+    /// [`PlotText::prim`] of a glyph cut by a viewport edge.
+    pub const CLIPPED: u32 = u32::MAX - 1;
 }
 
 impl DPrim {
@@ -134,7 +174,8 @@ impl DisplayList {
 pub struct Options {
     /// Chord tolerance in world units (about half a pixel at the current zoom).
     pub tolerance: f64,
-    /// Dashes shorter than this (world units) are drawn as continuous lines.
+    /// Two pixels in world units: shorter dashes are continuous and filled font text uses
+    /// screen-size detail. Zero keeps full detail (plots and image/vector exports).
     pub min_dash: f64,
     /// Draw text (off for very coarse previews).
     pub text: bool,
@@ -147,12 +188,26 @@ pub struct Options {
     /// Plot style table to draw with. When `None`, [`build`] of a layout whose page setup has
     /// "Display plot styles" on uses the layout's table; [`build_plot`] uses none.
     pub plot_style_table: Option<std::sync::Arc<cadcraft_doc::PlotStyleTable>>,
+    /// The area being looked at (world units of the space being built), for on-screen builds:
+    /// hatch patterns are only generated inside it. `None` = everywhere (plots, exports, picks).
+    pub view: Option<Bounds2>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { tolerance: 0.001, min_dash: 0.0, text: true, fill: true, lineweights: false, view_height: 0.0, plot_style_table: None }
+        Options { tolerance: 0.001, min_dash: 0.0, text: true, fill: true, lineweights: false, view_height: 0.0, plot_style_table: None, view: None }
     }
+}
+
+/// The largest axis scale of a transform's linear part (its largest singular value): a length
+/// `l` in the transform's own units measures at most `l * max_scale` after it, in any direction.
+/// A uniform scale gives its factor, where [`Mat3::scale_factor`] gives the mean of the axes.
+fn max_scale(m: &Mat3) -> f64 {
+    let (a, b, c, d) = (m.a, m.b, m.c, m.d);
+    let e = (a * a + b * b + c * c + d * d) / 2.0;
+    let f = (((a * a + b * b - c * c - d * d) / 2.0).powi(2) + (a * c + b * d).powi(2)).sqrt();
+    let s = (e + f).max(0.0).sqrt();
+    if s.is_finite() { s } else { 0.0 }
 }
 
 /// Graphics state inherited through block references.
@@ -196,6 +251,8 @@ struct Builder<'a> {
     styles: Option<&'a plotstyle::Styler>,
     /// Named plot style (table index) of the entity being drawn.
     named: Option<usize>,
+    /// The block-expansion budget shared by the parts of a list built in parallel.
+    shared_budget: Option<&'a std::sync::atomic::AtomicUsize>,
 }
 
 /// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
@@ -212,10 +269,21 @@ impl Builder<'_> {
             None => (color, lw),
         }
     }
+    /// Record the end, join and fill style `color` prints with for the primitive pushed next.
+    fn note_pen(&mut self, color: Ink) {
+        let Some(s) = self.styles else { return };
+        let pen = s.pen(color, self.named);
+        if !pen.is_object() {
+            let i = self.list.prims.len();
+            self.list.pens.resize(i, Pen::default());
+            self.list.pens.push(pen);
+        }
+    }
     fn polyline(&mut self, ctx: &Ctx, color: Ink, lw: f32, pts: &[Vec2]) {
         if pts.len() < 2 {
             return;
         }
+        self.note_pen(color);
         let (color, lw) = self.styled(color, lw);
         let start = self.list.verts.len() as u32;
         for p in pts {
@@ -226,13 +294,17 @@ impl Builder<'_> {
         self.list.prims.push(DPrim { handle: ctx.top, color: color.rgb, aci7: color.aci7, lw, kind: Kind::Polyline, start, len: pts.len() as u32 });
     }
     fn tris(&mut self, ctx: &Ctx, color: Ink, tris: &[Vec2]) {
+        self.tris_at(ctx, color, tris, ctx.xf);
+    }
+    fn tris_at(&mut self, ctx: &Ctx, color: Ink, tris: &[Vec2], xf: Mat3) {
         if tris.len() < 3 {
             return;
         }
+        self.note_pen(color);
         let (color, _) = self.styled(color, 0.0);
         let start = self.list.tris.len() as u32;
         for p in tris {
-            let q = ctx.xf.apply(*p);
+            let q = xf.apply(*p);
             self.list.bounds.add(q);
             self.list.tris.push(q);
         }
@@ -247,10 +319,33 @@ impl Builder<'_> {
             return;
         }
         let fill = self.opts.fill && ctx.d.header.i64("TEXTFILL", 1) != 0;
-        for g in &sh.glyphs {
+        // Plots note which filled outlines are font glyphs (see `DisplayList::texts`).
+        let mut text = sh.text.iter().peekable();
+        let pixel = if self.plotting { 0.0 } else { self.opts.min_dash * 0.5 };
+        for (i, g) in sh.glyphs.iter().enumerate() {
             if fill {
-                let tris = fill::triangulate_evenodd(g);
-                self.tris(ctx, color, &tris);
+                while text.next_if(|t| t.outline < i).is_some() {}
+                let glyph = text.next_if(|t| t.outline == i);
+                let at = self.list.prims.len();
+                let len = if let Some(t) = glyph {
+                    let xf = crate::text::placement(t, ctx.xf);
+                    let mesh = crate::text::mesh(t, xf, pixel);
+                    self.tris_at(ctx, color, &mesh.triangles, xf);
+                    mesh.triangles.len()
+                } else {
+                    let tris = fill::triangulate_evenodd(g);
+                    self.tris(ctx, color, &tris);
+                    tris.len()
+                };
+                if let Some(t) = glyph.filter(|_| self.plotting)
+                    && self.list.prims.len() > at
+                    && let (Ok(prim), Ok(verts)) = (u32::try_from(at), u32::try_from(len))
+                {
+                    let xf = &ctx.xf;
+                    let glyph = cadcraft_fonts::TextGlyph { origin: xf.apply(t.origin), x: xf.apply_vec(t.x), y: xf.apply_vec(t.y), ..t.clone() };
+                    let bounds = self.list.prims.get(at).map(|p| Bounds2::from_points(self.list.points(p).iter().copied())).unwrap_or(Bounds2::EMPTY);
+                    self.list.texts.push(PlotText { prim, verts, bounds, glyph });
+                }
             } else {
                 for c in g {
                     self.polyline(ctx, color, lw, c);
@@ -276,7 +371,10 @@ impl Builder<'_> {
     /// Take one unit of the block-expansion budget; false once it is spent.
     fn expand(&mut self) -> bool {
         self.list.expanded = self.list.expanded.saturating_add(1);
-        self.list.expanded <= MAX_BLOCK_EXPANSION
+        match self.shared_budget {
+            Some(spent) => spent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_BLOCK_EXPANSION,
+            None => self.list.expanded <= MAX_BLOCK_EXPANSION,
+        }
     }
 }
 
@@ -319,25 +417,97 @@ fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> Di
         _ => None,
     });
     let styler = table.map(|t| plotstyle::Styler::new(d, t));
-    let mut b = Builder { list: DisplayList::default(), opts, plotting, styles: styler.as_ref(), named: None };
+    let mut b = Builder { list: DisplayList::default(), opts, plotting, styles: styler.as_ref(), named: None, shared_budget: None };
     if let Space::Paper(name) = space {
         b.list.sheet = paper::sheet(d, name);
     }
     if let Some(store) = d.space(space) {
         let paper = matches!(space, Space::Paper(_));
+        #[cfg(not(target_arch = "wasm32"))]
+        if !paper && !plotting && b.styles.is_none() && store.len() >= 2 * PARALLEL_CHUNK {
+            build_parallel(&mut b, d, store);
+            return b.list;
+        }
         let mut viewports = 0usize;
         for e in store.iter() {
             if paper && let EntityKind::Viewport(vp) = &e.kind {
                 if viewports < MAX_VIEWPORTS {
                     viewports += 1;
                     viewport(&mut b, d, e, vp);
+                    if plotting {
+                        take_viewport_layers(&mut b.list);
+                    }
                 }
                 continue;
             }
             entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
         }
     }
+    // A layout is drawn in paper units, so its pens become geometry now.
+    if let Some(sheet) = b.list.sheet {
+        pen::apply(&mut b.list, sheet.unit_mm);
+    }
     b.list
+}
+
+/// Top-level entities per task when a display list is built on all cores.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_CHUNK: usize = 256;
+
+/// Build model space for the screen on all cores: the entities are split into chunks built
+/// side by side, then joined in drawing order, so the list is the same as a one-thread build.
+/// The canvas rebuilds the whole list at every 2x zoom step, on the UI thread; one core made
+/// that a visible stall on real drawings. Plots, layouts and plot styles keep the one-thread
+/// path (they run once, and their pens and per-primitive layers are built along the way).
+#[cfg(not(target_arch = "wasm32"))]
+fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStore) {
+    use rayon::prelude::*;
+    let ents: Vec<&std::sync::Arc<Entity>> = store.iter().collect();
+    let budget = std::sync::atomic::AtomicUsize::new(0);
+    let (opts, plotting) = (b.opts, b.plotting);
+    let parts: Vec<DisplayList> = ents
+        .par_chunks(PARALLEL_CHUNK)
+        .map(|chunk| {
+            let mut part = Builder { list: DisplayList::default(), opts, plotting, styles: None, named: None, shared_budget: Some(&budget) };
+            for e in chunk {
+                entity(&mut part, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
+            }
+            part.list
+        })
+        .collect();
+    // One allocation per array for the joined list.
+    b.list.prims.reserve(parts.iter().map(|p| p.prims.len()).sum());
+    b.list.verts.reserve(parts.iter().map(|p| p.verts.len()).sum());
+    b.list.tris.reserve(parts.iter().map(|p| p.tris.len()).sum());
+    for part in parts {
+        append(&mut b.list, part);
+    }
+}
+
+/// Append `src` to `dst`: its primitives index into `dst`'s vertex and triangle arrays.
+#[cfg(not(target_arch = "wasm32"))]
+fn append(dst: &mut DisplayList, src: DisplayList) {
+    let (verts, tris, prims) = (dst.verts.len() as u32, dst.tris.len() as u32, dst.prims.len() as u32);
+    // Pens are parallel to the primitives, with missing entries meaning "use object".
+    if !src.pens.is_empty() {
+        dst.pens.resize(dst.prims.len(), Pen::default());
+    }
+    dst.prims.extend(src.prims.into_iter().map(|mut p| {
+        p.start += if matches!(p.kind, Kind::Tris | Kind::Mask) { tris } else { verts };
+        p
+    }));
+    dst.verts.extend(src.verts);
+    dst.tris.extend(src.tris);
+    dst.prim_layers.extend(src.prim_layers);
+    dst.texts.extend(src.texts.into_iter().map(|mut t| {
+        if t.prim < PlotText::CLIPPED {
+            t.prim += prims;
+        }
+        t
+    }));
+    dst.pens.extend(src.pens);
+    dst.bounds = dst.bounds.union(&src.bounds);
+    dst.expanded = dst.expanded.saturating_add(src.expanded);
 }
 
 /// `opts` with a view height for relative point sizes: the extents height when none is given
@@ -394,7 +564,7 @@ fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewpor
     let mcenter = vp.view_center + (rect.center() - center) / s;
     // Model window with slack: entity bounds are approximate (text, dimensions).
     let win = Bounds2::new(mcenter - mhalf, mcenter + mhalf).expand(mhalf.x.max(mhalf.y) * 0.1);
-    let mut sub = Builder { list: DisplayList::default(), opts: b.opts, plotting: b.plotting, styles: b.styles, named: None };
+    let mut sub = Builder { list: DisplayList::default(), opts: b.opts, plotting: b.plotting, styles: b.styles, named: None, shared_budget: None };
     // PSLTSCALE on: model-space dashes are scaled so they measure the same on paper as in
     // paper space, whatever the viewport scale.
     let lt_factor = if d.header.i64("PSLTSCALE", 1) != 0 { 1.0 / s } else { 1.0 };
@@ -409,7 +579,20 @@ fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewpor
             continue;
         }
         entity(&mut sub, &Ctx { lt_factor, ..top_ctx(d, xf, VIEWPORT_CONTENT, &vp.frozen_layers, &vp.layer_colors) }, me);
+        // Plotted text glyphs move to the layout's list; their outlines carry the glyph's
+        // index there in their handle's high half until clipped (see `take_viewport_layers`).
+        for t in std::mem::take(&mut sub.list.texts) {
+            let k = b.list.texts.len() as u64 + 1;
+            if let Some(p) = sub.list.prims.get_mut(t.prim as usize)
+                && k < u64::from(u32::MAX)
+            {
+                p.handle = Handle(p.handle.0 | (k << 32));
+                b.list.texts.push(PlotText { prim: PlotText::NONE, ..t });
+            }
+        }
     }
+    // The contents are in paper units now: draw their pens before clipping.
+    pen::apply(&mut sub.list, paper::paper_unit_mm(d));
     b.list.expanded = b.list.expanded.saturating_add(sub.list.expanded);
     match &poly {
         Some(p) => append_clipped(&mut b.list, &sub.list, &Clip::Poly(p)),
@@ -519,11 +702,47 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
     } else {
         opts
     };
-    let mut b = Builder { list: DisplayList::default(), opts, plotting: false, styles: None, named: None };
+    let mut b = Builder { list: DisplayList::default(), opts, plotting: false, styles: None, named: None, shared_budget: None };
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     }
     b.list
+}
+
+/// The layer `e` is drawn on, as an index in the layer table: layer 0 inside a block is the
+/// block reference's layer.
+fn entity_layer(ctx: &Ctx, e: &Entity) -> u32 {
+    let name = if e.common.layer == "0" { ctx.block_layer.as_deref().unwrap_or("0") } else { e.common.layer.as_str() };
+    ctx.d.layers.iter().position(|l| l.name.eq_ignore_ascii_case(name)).and_then(|i| u32::try_from(i).ok()).unwrap_or(NO_LAYER)
+}
+
+/// After a viewport is appended to a plot: the layers its contents carry in their handles
+/// (see [`entity`]) go to [`DisplayList::prim_layers`], and the handles back to
+/// [`VIEWPORT_CONTENT`]. The viewport's border was tagged when it was drawn.
+///
+/// Text glyphs seen through the viewport (marked in the handles' high half) keep their outline
+/// primitive when it came through the clip whole; a glyph cut by the viewport edge stays
+/// geometry.
+fn take_viewport_layers(list: &mut DisplayList) {
+    let start = list.prim_layers.len();
+    for i in start..list.prims.len() {
+        let Some(p) = list.prims.get(i).copied() else { break };
+        list.prim_layers.push(u32::try_from(p.handle.0 & 0xFFFF_FFFF).unwrap_or(NO_LAYER));
+        let bounds = Bounds2::from_points(list.points(&p).iter().copied());
+        if let Some(t) = (p.handle.0 >> 32).checked_sub(1).and_then(|k| list.texts.get_mut(k as usize)) {
+            let same = |a: Vec2, b: Vec2| a.dist(b) <= 1e-9 * (1.0 + a.len());
+            let whole = t.prim == PlotText::NONE
+                && p.kind == Kind::Tris
+                && p.len == t.verts
+                && same(bounds.min, t.bounds.min)
+                && same(bounds.max, t.bounds.max);
+            // A second piece (or a cut one) means the clip changed the glyph.
+            t.prim = if whole { u32::try_from(i).unwrap_or(PlotText::NONE) } else { PlotText::CLIPPED };
+        }
+        if let Some(p) = list.prims.get_mut(i) {
+            p.handle = VIEWPORT_CONTENT;
+        }
+    }
 }
 
 fn resolve(ctx: &Ctx, e: &Entity, plotting: bool) -> (Ink, f32, Option<cadcraft_doc::Linetype>, f64, bool) {
@@ -578,6 +797,19 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     b.named = b.styles.and_then(|s| s.named_index(ctx, &e.common));
     entity_parts(b, ctx, e);
     b.named = saved;
+    if b.plotting && b.list.prim_layers.len() < b.list.prims.len() {
+        // What it drew that its block contents didn't claim is on its own layer.
+        let layer = entity_layer(ctx, e);
+        let from = b.list.prim_layers.len();
+        b.list.prim_layers.resize(b.list.prims.len(), layer);
+        if ctx.top == VIEWPORT_CONTENT {
+            // Model space seen through a viewport is clipped into the layout's list; the layer
+            // travels in the handle until then (see [`take_viewport_layers`]).
+            for p in b.list.prims.iter_mut().skip(from) {
+                p.handle = Handle(u64::from(layer));
+            }
+        }
+    }
 }
 
 fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
@@ -663,10 +895,11 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                     entity(b, &sub, be);
                 }
             } else {
-                dimension(b, ctx, e, dm, lw);
+                dimension(b, ctx, e, dm, lw, lt.as_ref(), ltscale);
             }
         }
         EntityKind::Hatch(h) => hatch::draw(b, ctx, e, h, rgb, lw, tol),
+        EntityKind::MLine(m) => mline::draw(b, ctx, e, m, rgb, lw, tol),
         EntityKind::LwPolyline(p) if p.const_width > 0.0 || p.vertices.iter().any(|v| v.start_width > 0.0 || v.end_width > 0.0) => {
             if b.opts.fill && ctx.d.header.i64("FILLMODE", 1) != 0 {
                 match &lt {
@@ -752,7 +985,8 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                 let st = ctx.d.dim_style(&l.style);
                 // DIMASZ × DIMSCALE of the leader's style (the drawing's DIMSCALE when it is 0).
                 let size = st.map(|s| s.arrow_size).unwrap_or(0.18) * leader_scale(ctx.d, st);
-                let kind = dim::Arrowhead::parse(st.map(|s| s.arrow_block.as_str()).unwrap_or(""));
+                // DIMLDRBLK ("" = closed filled).
+                let kind = dim::Arrowhead::parse(st.map(|s| s.leader_arrow_block.as_str()).unwrap_or(""));
                 let g = dim::arrowhead(kind, *a, (*a - *n).normalized(), size);
                 for l in &g.lines {
                     b.polyline(ctx, rgb, lw, l);
@@ -864,6 +1098,14 @@ pub fn layout_mtext_entity(d: &Drawing, t: &cadcraft_doc::MText) -> cadcraft_fon
         font: cadcraft_fonts::TextFont::resolve(&ts.font),
         width_factor: ts.width_factor,
         oblique: ts.oblique,
+        columns: t.columns.as_ref().map(|c| cadcraft_fonts::MTextColumnSpec {
+            dynamic: c.kind == cadcraft_doc::MTextColumnType::Dynamic,
+            count: usize::from(c.count.max(1)),
+            gutter: c.gutter,
+            height: c.height,
+            heights: if c.kind == cadcraft_doc::MTextColumnType::Dynamic && !c.auto_height { c.heights.clone() } else { Vec::new() },
+            reversed: c.flow_reversed,
+        }),
     };
     cadcraft_fonts::layout_mtext_with(&t.contents, &params)
 }
@@ -900,7 +1142,25 @@ pub fn dimension_in(d: &Drawing, dm: &cadcraft_doc::Dimension) -> DimGeometry {
     dim::dimension_geometry_with(dm, &style, d.header.f64("DIMSCALE", 1.0), &dim_text(d, &st))
 }
 
-fn dimension(b: &mut Builder, ctx: &Ctx, e: &Entity, dm: &cadcraft_doc::Dimension, lw: f32) {
+/// Draw a polyline with a linetype (None: continuous).
+fn stroke_with(b: &mut Builder, ctx: &Ctx, rgb: Ink, lw: f32, lt: Option<&cadcraft_doc::Linetype>, ltscale: f64, pts: &[Vec2]) {
+    match lt {
+        Some(lt) => {
+            let min = b.opts.min_dash / ctx.xf.scale_factor().max(1e-12);
+            for dash in linetype::apply(pts, lt, ltscale, min) {
+                match dash.as_slice() {
+                    [p] => b.point(ctx, rgb, *p),
+                    _ => b.polyline(ctx, rgb, lw, &dash),
+                }
+            }
+        }
+        None => b.polyline(ctx, rgb, lw, pts),
+    }
+}
+
+/// `lw` / `lt` are the dimension's own lineweight and linetype (ByBlock in DIMLWD, DIMLWE,
+/// DIMLTYPE, DIMLTEX1 and DIMLTEX2).
+fn dimension(b: &mut Builder, ctx: &Ctx, e: &Entity, dm: &cadcraft_doc::Dimension, lw: f32, lt: Option<&cadcraft_doc::Linetype>, ltscale: f64) {
     let d = ctx.d;
     let style = d.dim_style(&dm.style).cloned().unwrap_or_default().with_overrides(&dm.overrides);
     let g = dimension_in(d, dm);
@@ -915,101 +1175,52 @@ fn dimension(b: &mut Builder, ctx: &Ctx, e: &Entity, dm: &cadcraft_doc::Dimensio
     let dim_rgb = ink(style.dim_line_color, layer_color, own);
     let ext_rgb = ink(style.ext_line_color, layer_color, own);
     let txt_rgb = ink(style.text_color, layer_color, own);
-    for (l, role) in g.lines.iter().zip(g.line_roles.iter().chain(std::iter::repeat(&LineRole::Dim))) {
-        b.polyline(ctx, if *role == LineRole::Ext { ext_rgb } else { dim_rgb }, lw, l);
+    let layer = d.layer(layer_name);
+    let weight = |v: i16| -> f32 {
+        if !b.opts.lineweights {
+            return 0.0;
+        }
+        match Lineweight::from_dxf(v) {
+            Lineweight::ByBlock => lw,
+            Lineweight::Mm100(x) => f32::from(x) / 100.0,
+            Lineweight::ByLayer => match layer.map(|l| l.lineweight) {
+                Some(Lineweight::Mm100(x)) => f32::from(x) / 100.0,
+                _ => default_lineweight(d),
+            },
+            Lineweight::Default => default_lineweight(d),
+        }
+    };
+    let ltype = |name: &str| -> Option<cadcraft_doc::Linetype> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "byblock" => lt.cloned(),
+            "bylayer" => layer.and_then(|l| d.linetype(&l.linetype)).filter(|l| !l.pattern.is_empty()).cloned(),
+            _ => d.linetype(name.trim()).filter(|l| !l.pattern.is_empty()).cloned(),
+        }
+    };
+    let (dim_lw, ext_lw) = (weight(style.dim_lineweight), weight(style.ext_lineweight));
+    let (dim_lt, ext1_lt, ext2_lt) = (ltype(&style.dim_linetype), ltype(&style.ext_linetype1), ltype(&style.ext_linetype2));
+    for (i, (l, role)) in g.lines.iter().zip(g.line_roles.iter().chain(std::iter::repeat(&LineRole::Dim))).enumerate() {
+        let (rgb, w, t) = match role {
+            LineRole::Ext if g.ext2_lines.contains(&i) => (ext_rgb, ext_lw, ext2_lt.as_ref()),
+            LineRole::Ext => (ext_rgb, ext_lw, ext1_lt.as_ref()),
+            LineRole::Dim => (dim_rgb, dim_lw, dim_lt.as_ref()),
+        };
+        stroke_with(b, ctx, rgb, w, t, ltscale, l);
     }
     for t in &g.fills {
         b.tris(ctx, dim_rgb, t);
     }
     if b.opts.text {
-        let sh = cadcraft_fonts::Shaped { strokes: g.text.clone(), glyphs: g.text_glyphs.clone(), width: 0.0 };
+        let sh = cadcraft_fonts::Shaped { strokes: g.text.clone(), glyphs: g.text_glyphs.clone(), width: 0.0, text: g.text_runs.clone() };
         b.shaped(ctx, txt_rgb, lw, &sh);
     }
 }
 
-/// Covered cells of a table (inside another cell's merge, not its anchor).
-pub fn table_covered(t: &cadcraft_doc::Table) -> Vec<Vec<bool>> {
-    let rows = t.row_heights.len().min(10_000);
-    let cols = t.col_widths.len().min(10_000);
-    let mut cov = vec![vec![false; cols]; rows];
-    for (r, row) in t.cells.iter().enumerate().take(rows) {
-        for (c, cell) in row.iter().enumerate().take(cols) {
-            if let Some((rs, cs)) = cell.merged {
-                for rr in r..(r + rs.max(1) as usize).min(rows) {
-                    for cc in c..(c + cs.max(1) as usize).min(cols) {
-                        if (rr, cc) != (r, c)
-                            && let Some(x) = cov.get_mut(rr).and_then(|v| v.get_mut(cc))
-                        {
-                            *x = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    cov
-}
+mod table;
+pub use table::{MAX_LAYOUT_CELLS, TableFill, TableGeom, TableLine, TableText, table_covered, table_geometry, table_style_of};
 
 fn table(b: &mut Builder, ctx: &Ctx, t: &cadcraft_doc::Table, rgb: Ink, lw: f32) {
-    let o = t.insert.xy();
-    let rows = t.row_heights.len().min(10_000);
-    let cols = t.col_widths.len().min(10_000);
-    let xs: Vec<f64> = std::iter::once(0.0)
-        .chain(t.col_widths.iter().take(cols).scan(0.0, |a, w| {
-            *a += w;
-            Some(*a)
-        }))
-        .collect();
-    let ys: Vec<f64> = std::iter::once(0.0)
-        .chain(t.row_heights.iter().take(rows).scan(0.0, |a, h| {
-            *a += h;
-            Some(*a)
-        }))
-        .collect();
-    let cov = table_covered(t);
-    let style = ctx.d.table_styles.iter().find(|s| s.name.eq_ignore_ascii_case(&t.style)).cloned().unwrap_or_default();
-    let ts = text_style(ctx.d, "Standard");
-    let font = cadcraft_fonts::TextFont::resolve(&ts.font);
-    let x_at = |c: usize| xs.get(c).copied().unwrap_or(0.0);
-    let y_at = |r: usize| ys.get(r).copied().unwrap_or(0.0);
-    for r in 0..rows {
-        for c in 0..cols {
-            if cov.get(r).and_then(|v| v.get(c)).copied().unwrap_or(false) {
-                continue;
-            }
-            let cell = t.cells.get(r).and_then(|row| row.get(c));
-            let (rs, cs) = cell.and_then(|x| x.merged).map(|(a, b)| (a.max(1) as usize, b.max(1) as usize)).unwrap_or((1, 1));
-            let (r2, c2) = ((r + rs).min(rows), (c + cs).min(cols));
-            let (x0, x1, y0, y1) = (x_at(c), x_at(c2), y_at(r), y_at(r2));
-            let p = |x: f64, y: f64| o + Vec2::new(x, -y);
-            // Each cell draws its bottom and right edges; the outer top/left come from row 0 / col 0.
-            b.polyline(ctx, rgb, lw, &[p(x0, y1), p(x1, y1), p(x1, y0)]);
-            if r == 0 {
-                b.polyline(ctx, rgb, lw, &[p(x0, y0), p(x1, y0)]);
-            }
-            if c == 0 {
-                b.polyline(ctx, rgb, lw, &[p(x0, y0), p(x0, y1)]);
-            }
-            let Some(cell) = cell.filter(|x| !x.text.is_empty() && b.opts.text) else { continue };
-            let title = t.title && r == 0;
-            let header = t.header && r == usize::from(t.title);
-            let h = if title { t.text_height * 1.4 } else { t.text_height };
-            // Titles and headers are centred; data sits middle-left inside the cell margin.
-            let params = if title || header {
-                cadcraft_fonts::TextParams::centered(p((x0 + x1) / 2.0, (y0 + y1) / 2.0), h, 0.0)
-            } else {
-                let at = p(x0 + style.margin.max(0.0), (y0 + y1) / 2.0);
-                cadcraft_fonts::TextParams {
-                    align_pt: Some(at),
-                    h: cadcraft_fonts::Align::Left,
-                    v: cadcraft_fonts::VAlign::Middle,
-                    ..cadcraft_fonts::TextParams::new(at, h)
-                }
-            };
-            let (sh, _) = cadcraft_fonts::place(&font, &cell.text, &params);
-            b.shaped(ctx, rgb, lw, &sh);
-        }
-    }
+    table::draw(b, ctx, t, rgb, lw);
 }
 
 fn align(h: cadcraft_doc::HAlign, v: cadcraft_doc::VAlign) -> (cadcraft_fonts::Align, cadcraft_fonts::VAlign) {

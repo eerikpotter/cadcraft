@@ -14,6 +14,7 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     let Some(d) = app.ui.dialog.clone() else { return };
     let mut open = true;
     match d.as_str() {
+        "spacemouse" => crate::spacemouse::dialog(app, ctx, &mut open),
         "language" => language(app, ctx, &mut open),
         "layers" => crate::layers::dialog(app, ctx, &mut open),
         "qselect" => crate::quick::qselect_dialog(app, ctx, &mut open),
@@ -25,23 +26,32 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
         "commands" => commands(app, ctx, &mut open),
         "blocks" => blocks(app, ctx, &mut open),
         "stylesmanager" => crate::plotstyles::dialog(app, ctx, &mut open),
+        o if o == "options" || o.starts_with("options:") => crate::options::dialog(app, ctx, o, &mut open),
         other => crate::managers::dialog(app, ctx, other, &mut open),
     }
-    if !open {
+    // A dialog that closed by opening another (Plot Preview back to Plot) keeps the new one.
+    if !open && app.ui.dialog.as_deref() == Some(d.as_str()) {
         app.ui.dialog = None;
     }
 }
 
 fn dsettings(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
+    let settings = app.session.drafting_settings();
+    let (mut snapunit, mut gridunit) = (settings.snapunit, settings.gridunit);
     egui::Window::new(crate::tl!("Drafting Settings")).id(egui::Id::new("Drafting Settings")).open(open).resizable(false).show(ctx, |ui| {
         let s = &mut app.session.settings;
         ui.heading(crate::tl!("Snap and Grid"));
         ui.checkbox(&mut s.snapmode, crate::tl!("Snap On (F9)"));
+        // SNAPSTYL: the isometric snap and grid (ISODRAFT).
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut s.isodraft, false, crate::tl!("Rectangular snap"));
+            ui.radio_value(&mut s.isodraft, true, crate::tl!("Isometric snap"));
+        });
         ui.horizontal(|ui| {
             ui.label(crate::tl!("Snap X spacing"));
-            ui.add(egui::DragValue::new(&mut s.snapunit.x).speed(0.05).range(0.0001..=1e6));
+            ui.add(egui::DragValue::new(&mut snapunit.x).speed(0.05).range(0.0001..=1e6).clamp_existing_to_range(false));
             ui.label(crate::tl!("Y"));
-            ui.add(egui::DragValue::new(&mut s.snapunit.y).speed(0.05).range(0.0001..=1e6));
+            ui.add(egui::DragValue::new(&mut snapunit.y).speed(0.05).range(0.0001..=1e6).clamp_existing_to_range(false));
         });
         // SNAPTYPE and POLARDIST.
         ui.horizontal(|ui| {
@@ -58,7 +68,7 @@ fn dsettings(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
         ui.checkbox(&mut s.gridmode, crate::tl!("Grid On (F7)"));
         ui.horizontal(|ui| {
             ui.label(crate::tl!("Grid spacing"));
-            ui.add(egui::DragValue::new(&mut s.gridunit.x).speed(0.05).range(0.0001..=1e6));
+            ui.add(egui::DragValue::new(&mut gridunit.x).speed(0.05).range(0.0..=1e6).clamp_existing_to_range(false));
             ui.label(crate::tl!("Major line every"));
             ui.add(egui::DragValue::new(&mut s.gridmajor).range(1..=100));
         });
@@ -115,10 +125,18 @@ fn dsettings(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
                     ui.radio_value(&mut s.dynpi_absolute, false, crate::tl!("Relative"));
                     ui.radio_value(&mut s.dynpi_absolute, true, crate::tl!("Absolute"));
                 });
+                // DYNPROMPT: the prompt and its options (Down Arrow) beside the cursor.
+                ui.checkbox(&mut s.dynprompt, crate::tl!("Show command prompting near the crosshairs"));
             });
         });
         ui.checkbox(&mut s.orthomode, crate::tl!("Ortho (F8)"));
     });
+    // Drawing edits go through the same command as the CLI, including dirty state and undo.
+    for (name, before, after) in [("SNAPUNIT", settings.snapunit, snapunit), ("GRIDUNIT", settings.gridunit, gridunit)] {
+        if before != after {
+            let _ = app.run("setvar", json!({ "name": name, "value": [after.x, after.y] }));
+        }
+    }
 }
 
 /// The polar and object snap tracking options of Drafting Settings: additional angles
@@ -384,6 +402,14 @@ fn insert_block(app: &mut CadApp, name: &str) {
     }
 }
 
+/// The editor's lines as a list: a hanging indent of three text heights with a tab stop there
+/// (`\pxi-3,l3,t3;`) and each line a bullet or its number and a tab.
+fn as_list(buf: &str, numbered: bool) -> String {
+    let lines: Vec<String> =
+        buf.split('\n').enumerate().map(|(i, l)| if numbered { format!("{}.\t{l}", i + 1) } else { format!("•\t{l}") }).collect();
+    format!("\\pxi-3,l3,t3;{}", lines.join("\n"))
+}
+
 /// The multiline text editor shown while MTEXT asks for its contents.
 fn mtext_editor(app: &mut CadApp, ctx: &egui::Context) {
     let active = app.session.running.as_ref().is_some_and(|r| r.id == "mtext")
@@ -422,6 +448,16 @@ fn mtext_editor(app: &mut CadApp, ctx: &egui::Context) {
                 }
                 if ui.button("⌀").on_hover_text(crate::tl!("Diameter")).clicked() {
                     buf.push_str("%%c");
+                }
+                ui.separator();
+                if ui.button("⇥").on_hover_text(crate::tl!("Insert tab")).clicked() {
+                    buf.push('\t');
+                }
+                if ui.button("•≡").on_hover_text(crate::tl!("Bulleted list")).clicked() {
+                    buf = as_list(&buf, false);
+                }
+                if ui.button("1≡").on_hover_text(crate::tl!("Numbered list")).clicked() {
+                    buf = as_list(&buf, true);
                 }
             });
             let r = ui.add(

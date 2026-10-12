@@ -13,10 +13,12 @@ pub mod audit;
 pub mod autosave;
 pub mod cmd;
 mod finite;
+pub mod grip_dims;
 pub mod grips;
 mod guard;
 pub mod pointmod;
 pub mod prompt;
+mod recent;
 pub mod sample;
 pub mod select;
 pub mod snap;
@@ -35,8 +37,9 @@ use serde_json::Value;
 pub use cadcraft_doc as doc;
 pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
+pub use cmd::hatch::{PatternChoice, pattern_choices};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
-pub use prompt::{Accept, Input, Interactive, Prompt, Step};
+pub use prompt::{Accept, Drag, Input, Interactive, Picker, Prompt, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -301,7 +304,8 @@ impl DocState {
     }
 }
 
-/// Session-level drafting settings (the AutoCAD system variables stored in the registry/profile).
+/// Session-level drafting settings. [`Session::drafting_settings`] supplies the active drawing's
+/// snap/grid spacing in the corresponding fields for UI and JSON consumers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -312,9 +316,11 @@ pub struct Settings {
     pub polarang: f64,
     pub gridmode: bool,
     pub snapmode: bool,
+    /// SNAPUNIT in a drafting settings snapshot; stored in the drawing header.
     pub snapunit: Vec2,
     /// OSNAPHATCH: object snaps find hatch objects (off by default, as in AutoCAD).
     pub osnaphatch: bool,
+    /// GRIDUNIT in a drafting settings snapshot; zero components follow SNAPUNIT.
     pub gridunit: Vec2,
     /// Major grid line every N minor lines (GRIDMAJOR).
     pub gridmajor: u32,
@@ -323,12 +329,21 @@ pub struct Settings {
     /// -VIEW sEttings > Layer snapshot: named views save the layer settings with them.
     pub view_layer_snapshot: bool,
     pub dynmode: bool,
+    /// DYNDIGRIP: which dimensions grip dimensional input shows while a grip is stretched (bits:
+    /// 1 resulting length, 2 length change, 4 absolute angle, 8 angle change, 16 radius); read
+    /// when DYNDIVIS = 2.
+    pub dyndigrip: u32,
+    /// DYNDIVIS: how many of them: 0 the first, 1 the first two (default), 2 all DYNDIGRIP asks for.
+    pub dyndivis: u8,
     /// DYNPIFORMAT = 1: Dynamic Input shows second and next points as Cartesian `x,y` instead of
     /// polar `distance<angle` (the default).
     pub dynpi_cartesian: bool,
     /// DYNPICOORDS = 1: second and next points typed into Dynamic Input are absolute instead of
     /// relative to the last point (the default).
     pub dynpi_absolute: bool,
+    /// DYNPROMPT: Dynamic Input shows the prompt beside the cursor, and Down Arrow opens the
+    /// prompt's options there (on by default).
+    pub dynprompt: bool,
     pub lwdisplay: bool,
     pub transparency_display: bool,
     pub selection_cycling: bool,
@@ -350,7 +365,10 @@ pub struct Settings {
     pub cursorsize: f64,
     /// MAXARRAY: the most objects one array command creates (items × selected objects).
     pub maxarray: u64,
+    /// SNAPSTYL 1: isometric snap and grid, ortho and crosshair along the isometric plane's axes.
     pub isodraft: bool,
+    /// SNAPISOPAIR: the current isometric plane (ISOPLANE, F5).
+    pub isoplane: snap::iso::IsoPlane,
     pub annoallvisible: bool,
     pub annoautoscale: bool,
     /// QPMODE: show the Quick Properties palette when objects are selected.
@@ -383,8 +401,11 @@ impl Default for Settings {
             zoomfactor: 60,
             view_layer_snapshot: true,
             dynmode: true,
+            dyndigrip: 31,
+            dyndivis: 1,
             dynpi_cartesian: false,
             dynpi_absolute: false,
+            dynprompt: true,
             lwdisplay: false,
             transparency_display: false,
             selection_cycling: false,
@@ -399,6 +420,7 @@ impl Default for Settings {
             cursorsize: 5.0,
             maxarray: 100_000,
             isodraft: false,
+            isoplane: snap::iso::IsoPlane::Left,
             annoallvisible: true,
             annoautoscale: false,
             qpmode: false,
@@ -521,6 +543,8 @@ pub struct Session {
     pub active: usize,
     pub settings: Settings,
     pub running: Option<Running>,
+    /// A script is running ([`Session::script`]); a SCRIPT command inside it is refused.
+    in_script: bool,
     /// The command suspended while a transparent command (`'ZOOM`, `'PAN`…) prompts inside it;
     /// it resumes when that command ends. One level, as in AutoCAD.
     pub suspended: Option<Running>,
@@ -538,6 +562,10 @@ pub struct Session {
     /// The deferred tangent/perpendicular snap under the cursor, if any (from the UI; lets the
     /// rubber band show the line it resolves to).
     pub cursor_deferred: Option<snap::Deferred>,
+    /// Origin of the point currently being fed by `input_snapped`; never reused by typed points.
+    picked_viewport: Option<snap::ViewportPoint>,
+    /// The last drawing comparison (COMPARE), drawn over the drawing it was made for.
+    pub compare: Option<cmd::file::compare::Comparison>,
     /// Object snap tracking: acquired points and the path under the cursor (from the UI's
     /// [`Session::snap_cursor`] calls; direct distance entry follows the path).
     pub tracking: snap::tracking::Tracker,
@@ -557,6 +585,8 @@ pub struct Session {
     pub last_used: LastUsed,
     /// Where `clipboard` came from and the layers, styles and blocks its objects need.
     pub clipboard_source: Option<cmd::clipboard::ClipSource>,
+    /// The window last picked with PLOTWINDOW (the Plot dialog's "Window <").
+    pub plot_window: Option<cadcraft_geom::Bounds2>,
 }
 
 impl Default for Session {
@@ -578,6 +608,7 @@ impl Session {
             active: 0,
             settings: Settings::default(),
             running: None,
+            in_script: false,
             suspended: None,
             log: Vec::new(),
             last_command: None,
@@ -586,6 +617,8 @@ impl Session {
             point_mods: Vec::new(),
             cursor: Vec2::ZERO,
             cursor_deferred: None,
+            picked_viewport: None,
+            compare: None,
             tracking: snap::tracking::Tracker::default(),
             viewport_px: (1200.0, 800.0),
             clipboard: Vec::new(),
@@ -597,6 +630,7 @@ impl Session {
             last_dim: None,
             last_used: LastUsed::default(),
             clipboard_source: None,
+            plot_window: None,
         }
     }
     pub fn new_drawing(&mut self, metric: bool) -> usize {
@@ -634,6 +668,15 @@ impl Session {
     /// Copy-on-write access to the drawing.
     pub fn doc_mut(&mut self) -> Result<&mut Drawing> {
         Ok(Arc::make_mut(&mut self.state_mut()?.doc))
+    }
+    /// Settings for the active drawing, without caching drawing variables in the profile.
+    pub fn drafting_settings(&self) -> Settings {
+        let mut settings = self.settings.clone();
+        if let Ok(d) = self.doc() {
+            settings.snapunit = d.header.snap_unit();
+            settings.gridunit = d.header.grid_unit();
+        }
+        settings
     }
     /// The space commands act on (model space while working inside a layout viewport).
     pub fn space(&self) -> Space {
@@ -818,6 +861,16 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Feed an object-snap pick, retaining its viewport origin for measurements. Point modifiers
+    /// that combine or constrain coordinates produce ordinary drawing-space points.
+    pub fn input_snapped(&mut self, hit: snap::SnapHit) -> Result<()> {
+        let source = hit.viewport.filter(|_| self.point_mods.iter().all(|f| matches!(f, pointmod::Frame::Snap { mode } if *mode != 0)));
+        let previous = std::mem::replace(&mut self.picked_viewport, source);
+        let result = self.input(hit.input());
+        self.picked_viewport = previous;
+        result
     }
 
     /// Give an input to the running command. With no command running, `Enter` repeats the last
@@ -1137,6 +1190,16 @@ impl Session {
         r.machine.preview(self, cursor).into_iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k }).collect()
     }
 
+    /// The active command's preview as a transform of existing objects (see
+    /// [`Interactive::drag`]), with its extra rubber-band geometry as entities.
+    pub fn drag(&self, cursor: Vec2) -> Option<(Drag, Vec<Entity>)> {
+        let r = self.running.as_ref()?;
+        let d = r.machine.drag(self, cursor)?;
+        let common = self.current_common();
+        let extra = d.extra.iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k.clone() }).collect();
+        Some((d, extra))
+    }
+
     /// Process one line typed at the command line (Enter pressed). Spaces separate inputs as in a
     /// script line (see [`Session::script`]), so `MOVE L  0,0 5,5` ends the selection with the
     /// second space and `ERASE L ` with the trailing one. Input after the command ends is ignored.
@@ -1241,7 +1304,7 @@ impl Session {
             {
                 let mut c = self.cursor;
                 if self.settings.orthomode {
-                    c = snap::ortho(base, c);
+                    c = snap::iso::constrain(&self.drafting_settings(), base, c);
                 }
                 let dir = (c - base).normalized();
                 let dir = if dir == Vec2::ZERO { Vec2::X } else { dir };
@@ -1254,7 +1317,20 @@ impl Session {
     /// Run a script, as AutoCAD reads one: a space or a line end ends an input, and an empty
     /// input (two spaces in a row, a space at the end of a line, an empty line) is Enter. At
     /// free-text prompts spaces are part of the text. Lines starting with `;` are comments.
+    ///
+    /// A script cannot run a script: the SCRIPT command (or another `cmd {json}` call) inside a
+    /// running one is refused, so two files that run each other cannot recurse until the stack dies.
     pub fn script(&mut self, text: &str) -> Result<()> {
+        if self.in_script {
+            return Err(EngineError::BadParams { cmd: "script".into(), msg: "a script is already running; nested scripts are not supported".into() });
+        }
+        self.in_script = true;
+        let r = self.script_lines(text);
+        self.in_script = false;
+        r
+    }
+
+    fn script_lines(&mut self, text: &str) -> Result<()> {
         for line in text.lines() {
             // Trailing spaces are inputs (Enter); other trailing whitespace (`\r`) is not.
             let line = line.trim_end_matches(|c: char| c.is_whitespace() && c != ' ');
@@ -1411,7 +1487,7 @@ impl Session {
             "prompt": self.prompt_text(),
             "running": self.running.as_ref().map(|r| r.id.clone()),
             "selection": self.selection().iter().map(|h| h.hex()).collect::<Vec<_>>(),
-            "settings": self.settings,
+            "settings": self.drafting_settings(),
         })
     }
 }

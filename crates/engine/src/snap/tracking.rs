@@ -587,14 +587,42 @@ pub fn candidate(
     cfg: &TrackConfig,
     base: Option<Vec2>,
 ) -> Option<Acquired> {
-    let nothing_to_acquire = !cfg.otrack && !cfg.running(mode::EXT | mode::PAR | mode::APP);
-    if nothing_to_acquire || !(cursor.is_finite() && aperture.is_finite() && aperture > 0.0) {
+    if !can_acquire(cursor, aperture, cfg) {
         return None;
     }
     let ix = crate::spatial::index(d, space);
     let prims = super::gather(d, space, &ix, cursor, aperture, mode::NEA).map(|(_, p)| p).unwrap_or_default();
+    candidate_from_prims(cursor, hit, aperture, cfg, base, &prims)
+}
+
+pub(crate) fn candidate_with_prims(
+    cursor: Vec2,
+    hit: Option<&SnapHit>,
+    aperture: f64,
+    cfg: &TrackConfig,
+    base: Option<Vec2>,
+    prims: &[Prim],
+) -> Option<Acquired> {
+    if !can_acquire(cursor, aperture, cfg) {
+        return None;
+    }
+    candidate_from_prims(cursor, hit, aperture, cfg, base, prims)
+}
+
+fn can_acquire(cursor: Vec2, aperture: f64, cfg: &TrackConfig) -> bool {
+    (cfg.otrack || cfg.running(mode::EXT | mode::PAR | mode::APP)) && cursor.is_finite() && aperture.is_finite() && aperture > 0.0
+}
+
+fn candidate_from_prims(
+    cursor: Vec2,
+    hit: Option<&SnapHit>,
+    aperture: f64,
+    cfg: &TrackConfig,
+    base: Option<Vec2>,
+    prims: &[Prim],
+) -> Option<Acquired> {
     let hit = hit.filter(|h| h.deferred.is_none() && h.mode != mode::NEA && h.point.is_finite());
-    let ext_end = if cfg.running(mode::EXT) { extension_near(&prims, hit.map_or(cursor, |h| h.point), aperture) } else { None };
+    let ext_end = if cfg.running(mode::EXT) { extension_near(prims, hit.map_or(cursor, |h| h.point), aperture) } else { None };
     if let Some((at, ext)) = ext_end
         && hit.is_none_or(|h| h.point.dist(at) <= cadcraft_geom::EPS * (1.0 + at.len()))
     {
@@ -749,7 +777,8 @@ impl crate::Session {
     /// acquires it for tracking), then grid snap, then tracking paths (polar, object snap
     /// tracking, Extension, Parallel, Apparent Intersection), then ortho.
     pub fn snap_cursor(&mut self, raw: Vec2, q: &CursorQuery) -> CursorSnap {
-        let s = self.settings.clone();
+        // Snap and grid spacing are the drawing's (SNAPUNIT/GRIDUNIT live in its header).
+        let s = self.drafting_settings();
         let angbase = self.angle_settings().angbase;
         let Ok(st) = self.state() else { return CursorSnap { point: raw, ..Default::default() } };
         let (doc, space) = (st.doc.clone(), st.edit_space());
@@ -760,17 +789,23 @@ impl crate::Session {
         let last = self.last_segment.filter(|(_, b)| q.base.is_some_and(|base| base.near(*b, 1e-9 * (1.0 + b.len())))).map(|(a, b)| a.angle_to(b));
         let cfg = TrackConfig::relative_to(&s, angbase, last);
         let osmode = s.osmode | if s.osnaphatch { mode::HATCH } else { 0 };
-        let hit = super::osnap(&doc, &space, raw, q.aperture, osmode, q.base, q.deferred);
-        let cand = candidate(&doc, &space, raw, hit.as_ref(), q.aperture, &cfg, q.base);
+        let ix = crate::spatial::index(&doc, &space);
+        let (hit, near_prims) = super::osnap_with_neighborhood(&doc, &space, &ix, raw, q.aperture, osmode, q.base, q.deferred);
+        let cand = match (osmode & mode::HATCH, near_prims.as_deref()) {
+            (0, Some(prims)) => candidate_with_prims(raw, hit.as_ref(), q.aperture, &cfg, q.base, prims),
+            _ => candidate(&doc, &space, raw, hit.as_ref(), q.aperture, &cfg, q.base),
+        };
         let wait = self.tracking.hover(cand, q.now, cfg.shift_acquire, q.shift);
         if let Some(h) = hit {
             self.tracking.last = None;
             return CursorSnap { point: h.point, snap: Some(h), track: None, wait };
         }
+        // Isometric snap (SNAPSTYL 1): its lattice in place of the rectangular grid.
+        let (raw, s) = super::iso::grid_snap(&doc, s, raw);
         let mut p = raw;
         if s.snapmode && !s.polarsnap {
             let (origin, angle) = super::grid_frame(&doc);
-            p = super::grid_snap(p, s.snapunit, origin, angle);
+            p = super::grid_snap(p, doc.header.snap_unit(), origin, angle);
         }
         if let Some(mut t) = self.tracking.track(&doc, &space, p, q.aperture, q.tol, &cfg, q.base) {
             // PolarSnap (SNAPTYPE 1): steps of POLARDIST, or of the snap X spacing when it is 0.
@@ -787,7 +822,7 @@ impl crate::Session {
         if let Some(b) = q.base
             && s.orthomode
         {
-            p = super::ortho(b, p);
+            p = super::iso::ortho(&self.settings, b, p);
         }
         CursorSnap { point: p, snap: None, track: None, wait }
     }

@@ -2,6 +2,9 @@
 //! registered by the host (desktop/CLI) via [`crate::cmd::file::set_io`]. On the web, where there is
 //! no file system, saved files reach the user through the host's [`crate::cmd::file::set_deliver`].
 
+mod pgp;
+mod template;
+
 use std::sync::OnceLock;
 
 use cadcraft_doc::Drawing;
@@ -9,7 +12,10 @@ pub use cadcraft_dxf::Version;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::{Result, Session};
+use crate::{Accept, Input, Prompt, Result, Session, Step};
+
+pub(crate) use pgp::{specs as alias_specs, user_alias};
+pub use template::{qnew_template, set_qnew_template};
 
 /// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`).
 pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
@@ -30,6 +36,9 @@ pub fn set_io(h: IoHooks) {
 pub fn io() -> Option<&'static IoHooks> {
     IO.get()
 }
+
+/// COMPARE (drawing comparison).
+pub mod compare;
 
 /// Hand finished file bytes to the user where there is no file system (the browser: a download).
 /// Arguments: file name, MIME type, bytes. `Ok` only once the delivery was actually started.
@@ -123,7 +132,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["File", "New Drawing..."])
             .key("Cmd+N")
             .alias(&["qnew"])
-            .params("{metric?: bool}")
+            .params("{metric?: bool, template?: path to a .dwt/.dxf template (\".\" for none; default QNEWTEMPLATE)}")
             .enabled(always)
             .noundo(),
         CommandSpec::new("open", "Open...", run_open)
@@ -144,10 +153,73 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("document.bytes", "Drawing as bytes", run_bytes)
             .params("{format?: dxf, version?: 2000…2018, binary?: bool} → {data: base64}")
             .noundo(),
+        CommandSpec::new("script", "Run Script...", run_script)
+            .menu(&["Tools", "Run Script..."])
+            .alias(&["scr"])
+            .params("{path: script (.scr) file} | {data: base64} → {lines}")
+            .noundo()
+            .interactive(|_| Ok(Box::new(ScriptM))),
     ]
 }
 
+/// SCRIPT: run the lines of a `.scr` file through [`Session::script`] — the same execution the
+/// CLI, MCP and the control channel already use, now reachable from the command line and menus.
+fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = if let Some(_path) = str_param(p, "path") {
+        #[cfg(not(target_arch = "wasm32"))]
+        let path = _path;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bytes = std::fs::read(path).map_err(|e| bad("script", format!("{path}: {e}")))?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        #[cfg(target_arch = "wasm32")]
+        return Err(bad("script", "paths are not available on the web; pass `data`"));
+    } else {
+        let data = str_param(p, "data").ok_or_else(|| bad("script", "`path` or `data` (base64) is required"))?;
+        let bytes = base64_decode(data).ok_or_else(|| bad("script", "invalid base64"))?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let lines = text.lines().count();
+    s.script(&text)?;
+    Ok(json!({ "lines": lines }))
+}
+
+/// SCRIPT typed at the command line or chosen from the menu: asks for the script file by name
+/// (the prompt form; the menu item runs this same machine).
+struct ScriptM;
+
+impl Interactive for ScriptM {
+    fn name(&self) -> &'static str {
+        "SCRIPT"
+    }
+    fn prompt(&self, _: &Session) -> Prompt {
+        Prompt::new("Enter name of script file", Accept::TEXT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if matches!(i, Input::Cancel | Input::Enter) {
+            return Ok(Step::Cancel);
+        }
+        let Input::Text(t) = i else { return Ok(Step::Continue) };
+        let t = t.trim();
+        if t.is_empty() {
+            return Ok(Step::Cancel);
+        }
+        match run_script(s, &json!({ "path": t })) {
+            Ok(_) => Ok(Step::Done),
+            Err(EngineError::BadParams { msg, .. }) => {
+                s.echo(msg);
+                Ok(Step::Done)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(r) = template::run_new(s, p)? {
+        return Ok(r);
+    }
     let i = s.new_drawing(bool_or(p, "metric", false));
     Ok(json!({ "index": i, "title": s.docs.get(i).map(|d| d.title.clone()) }))
 }
@@ -159,6 +231,9 @@ fn file_name(path: &str) -> String {
 pub(crate) fn open_bytes(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>) -> Result<usize> {
     let hooks = io().ok_or_else(|| bad("open", "file formats are not available in this build"))?;
     let d = (hooks.read)(bytes, name).map_err(|e| bad("open", e))?;
+    // A file that isn't a drawing (an imported SVG) gives the drawing no file name: QSAVE then
+    // asks where to save instead of exporting over the original.
+    let path = path.filter(|p| is_drawing_file(p));
     let i = s.open_drawing(d, &file_name(name), path);
     if let Some(st) = s.docs.get_mut(i) {
         // QSAVE keeps a binary DXF binary.
@@ -175,6 +250,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
         {
             let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
             let i = open_bytes(s, &bytes, path, Some(path.to_string()))?;
+            super::blocks::xref::after_open(s, i);
             return Ok(json!({ "index": i, "entities": s.docs.get(i).map(|d| d.doc.entity_count()) }));
         }
         #[cfg(target_arch = "wasm32")]
@@ -184,6 +260,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
     let bytes = base64_decode(data).ok_or_else(|| bad("open", "invalid base64"))?;
     let name = str_param(p, "name").unwrap_or("Drawing.dxf");
     let i = open_bytes(s, &bytes, name, None)?;
+    super::blocks::xref::after_open(s, i);
     Ok(json!({ "index": i }))
 }
 
@@ -326,14 +403,14 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let lost = not_saved(s.doc()?);
     let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
-    if is_drawing_file(&format!("drawing.{fmt}")) {
+    if drops_unknown(&format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     }
     Ok(r)
 }
 
 /// Entities a DXF or DWG file doesn't keep: those of object types CADCraft doesn't model
-/// (MLINE, 3DSOLID, MULTILEADER… read from other programs' files and kept in the drawing, but
+/// (3DSOLID, MULTILEADER… read from other programs' files and kept in the drawing, but
 /// not written), counted by DXF type across model space, layouts and block definitions.
 pub fn not_saved(d: &Drawing) -> std::collections::BTreeMap<String, usize> {
     let mut out: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -353,13 +430,20 @@ pub fn not_saved_message(lost: &std::collections::BTreeMap<String, usize>) -> Op
         return None;
     }
     let list: Vec<String> = lost.iter().map(|(t, n)| format!("{n} {t}")).collect();
-    Some(format!("Not saved (CADCraft can't write these object types yet): {}", list.join(", ")))
+    Some(format!("Not saved in the DWG file (its writer can't write these object types yet; DXF keeps them): {}", list.join(", ")))
+}
+
+/// Whether saving to `path` leaves out the entities [`not_saved`] counts: DWG does (the DWG
+/// bridge drops types it doesn't know); DXF writes them back as read.
+pub fn drops_unknown(path: &str) -> bool {
+    // Templates (.dwt) are written as DWG too.
+    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg") || e.eq_ignore_ascii_case("dwt"))
 }
 
 /// Whether `path` is saved as a drawing (DXF, DWG) rather than exported as an image.
 fn is_drawing_file(path: &str) -> bool {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "dxf" | "dwg" | "")
+    matches!(ext.as_str(), "dxf" | "dwg" | "dwt" | "")
 }
 
 /// Say on the command line what the file couldn't keep, and list it in the result's `notSaved`.
@@ -375,7 +459,7 @@ fn report_not_saved(s: &mut Session, r: &mut Value, lost: &std::collections::BTr
 fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> Result<Value>) -> Result<Value> {
     let lost = s.doc().map(not_saved).unwrap_or_default();
     let mut r = run(s, p)?;
-    if r.get("path").and_then(Value::as_str).is_some_and(is_drawing_file) {
+    if r.get("path").and_then(Value::as_str).is_some_and(drops_unknown) {
         report_not_saved(s, &mut r, &lost);
     }
     Ok(r)
@@ -439,6 +523,56 @@ mod tests {
 
     fn active_title(s: &Session) -> String {
         s.state().unwrap().title.clone()
+    }
+
+    fn temp_script(name: &str, text: &str) -> String {
+        let path = std::env::temp_dir().join(format!("cadcraft-script-{}-{name}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn script_command_runs_a_scr_file() {
+        let path = temp_script("run.scr", "; a comment\ncircle 50,25 20\nrectang 0,0 100,60\n");
+        let mut s = Session::new();
+        let r = s.execute("script", &json!({ "path": path })).unwrap();
+        assert_eq!(r["lines"], 3);
+        assert_eq!(s.state().unwrap().doc.model.len(), 2, "the comment is skipped, circle and rectang draw");
+    }
+
+    #[test]
+    fn script_command_reports_a_missing_file() {
+        let mut s = Session::new();
+        let e = s.execute("script", &json!({ "path": "no/such/script.scr" })).unwrap_err().to_string();
+        assert!(e.contains("no/such/script.scr"), "{e}");
+        assert_eq!(s.state().unwrap().doc.model.len(), 0);
+    }
+
+    /// A script that runs itself must be refused, not recurse until the stack dies.
+    #[test]
+    fn a_script_cannot_start_a_script() {
+        let inner = temp_script("inner.scr", "circle 0,0 1\n");
+        let outer = temp_script("outer.scr", &format!("script {}\ncircle 0,0 2\n", json!({ "path": inner })));
+        let mut s = Session::new();
+        let e = s.execute("script", &json!({ "path": outer })).unwrap_err().to_string();
+        assert!(e.contains("already running"), "{e}");
+    }
+
+    #[test]
+    fn typed_script_prompts_for_the_file_then_runs_or_reports_it() {
+        let good = temp_script("typed.scr", "circle 0,0 1\n");
+        let mut s = Session::new();
+        s.cmdline("script").unwrap();
+        assert!(s.running.is_some(), "SCRIPT asks for the file name");
+        s.cmdline(&good).unwrap();
+        assert!(s.running.is_none());
+        assert_eq!(s.state().unwrap().doc.model.len(), 1);
+
+        // A file that cannot be read: the error is echoed, the command still ends.
+        s.cmdline("script").unwrap();
+        s.cmdline("no/such/script.scr").unwrap();
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l.contains("no/such/script.scr")), "{:?}", s.log);
     }
 
     #[test]

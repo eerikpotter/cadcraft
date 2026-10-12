@@ -504,9 +504,10 @@ pub(crate) fn offset_kind(k: &EntityKind, dist: f64, side: Vec2) -> Option<Entit
                 ge.tessellate(e.major.xy().len() * 1e-3, &mut pts);
                 cadcraft_geom::point_in_polygon(&pts, side)
             };
+            // offset_points shifts along the left normal, which points into a counter-clockwise ellipse.
             let mut pts = Vec::new();
             ge.tessellate(e.major.xy().len() * 1e-3, &mut pts);
-            let off = offset_points(&pts, if inside { -dist } else { dist }, ge.is_full());
+            let off = offset_points(&pts, if inside { dist } else { -dist }, ge.is_full());
             Some(lwpoly(off.into_iter().map(PolyVertex::new).collect(), ge.is_full()))
         }
         EntityKind::LwPolyline(p) => {
@@ -1182,6 +1183,8 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                     .collect(),
             )
         }
+        // A helix explodes into its spline (seen from above).
+        EntityKind::Helix(h) => Some(vec![Entity { handle: Handle(0), common: e.common.clone(), kind: EntityKind::Spline(h.spline()) }]),
         EntityKind::Polyline3d(p) => Some(
             p.points
                 .windows(2)
@@ -1191,6 +1194,7 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                 })
                 .collect(),
         ),
+        EntityKind::MLine(m) => Some(super::draw2::mline::explode(e, m)),
         EntityKind::MText(m) => Some(
             cadcraft_fonts::plain_mtext(&m.contents)
                 .split('\n')
@@ -1213,6 +1217,19 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                             valign: Default::default(),
                         }),
                     }
+                })
+                .collect(),
+        ),
+        // A region explodes into its boundary's lines and arcs.
+        EntityKind::Region(r) => Some(
+            r.segments()
+                .into_iter()
+                .map(|s| {
+                    let k = match s {
+                        Segment::Line(l) => line(l.a, l.b),
+                        Segment::Arc { arc: a, .. } => arc(&a),
+                    };
+                    Entity { handle: Handle(0), common: e.common.clone(), kind: k }
                 })
                 .collect(),
         ),
@@ -1258,6 +1275,7 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                         contents: g.value.clone(),
                         line_spacing: 1.0,
                         line_spacing_exact: false,
+                        columns: None,
                     }),
                 });
             }
@@ -1694,6 +1712,26 @@ impl SelectThen {
     }
 }
 
+/// Objects whose text MIRROR keeps readable instead of mirroring it with the geometry.
+fn keeps_reading_when_mirrored(k: &EntityKind) -> bool {
+    match k {
+        EntityKind::Insert(i) => !i.attribs.is_empty(),
+        k => matches!(
+            k,
+            EntityKind::Text(_)
+                | EntityKind::AttDef(_)
+                | EntityKind::MText(_)
+                | EntityKind::Dimension(_)
+                | EntityKind::MLeader(_)
+                | EntityKind::Table(_)
+                | EntityKind::Tolerance(_)
+        ),
+    }
+}
+
+/// Text objects transformed for each frame of a MIRROR preview (on the CPU); more are not drawn.
+const MAX_MIRROR_TEXT_PREVIEW: usize = 1000;
+
 /// A finite length greater than zero (rejects 0, negatives, NaN and infinity).
 fn positive_length(v: Option<f64>) -> Option<f64> {
     v.filter(|f| f.is_finite() && *f > 1e-12)
@@ -1909,6 +1947,41 @@ impl Interactive for SelectThen {
         out.push(line(base, c));
         out
     }
+    fn drag(&self, s: &Session, c: Vec2) -> Option<crate::prompt::Drag> {
+        if (self.op == Op::Rotate && self.reference) || !self.sel.done {
+            return None;
+        }
+        let base = self.pts.first().copied()?;
+        let matrix = match self.op {
+            Op::Move | Op::Copy => Mat3::translate(c - base),
+            Op::Rotate => Mat3::rotate_about(base, base.angle_to(c)),
+            Op::Scale if !self.reference => Mat3::scale_about(base, base.dist(c).max(1e-9)),
+            Op::Scale => Mat3::scale_about(base, self.ref_len.and_then(|r| positive_length(Some(base.dist(c) / r)))?),
+            Op::Mirror if !self.ask_erase => Mat3::mirror(base, c),
+            _ => return None,
+        };
+        let mut extra = vec![line(base, c)];
+        if self.op != Op::Mirror {
+            return Some(crate::prompt::Drag { handles: self.objs.clone(), matrix, extra, clipboard: false });
+        }
+        // Mirrored text keeps reading left to right (MIRRTEXT 0), which the matrix alone can't
+        // draw: those objects are transformed one by one, the rest is mirrored on the GPU.
+        let d = s.doc().ok()?;
+        let mut handles = Vec::with_capacity(self.objs.len());
+        let mut texts = 0;
+        for h in &self.objs {
+            let Some(e) = d.entity(*h) else { continue };
+            if !keeps_reading_when_mirrored(&e.kind) {
+                handles.push(*h);
+            } else if texts < MAX_MIRROR_TEXT_PREVIEW {
+                texts += 1;
+                let mut k = e.kind.clone();
+                k.transform(&matrix);
+                extra.push(k);
+            }
+        }
+        Some(crate::prompt::Drag { handles, matrix, extra, clipboard: false })
+    }
 }
 
 /// An OFFSET option prompt opened from "Specify offset distance".
@@ -1920,6 +1993,7 @@ enum OffsetAsk {
 
 struct OffsetM {
     dist: Option<f64>,
+    distance_first: Option<Vec2>,
     through: bool,
     picked: Option<Handle>,
     ask: Option<OffsetAsk>,
@@ -1932,7 +2006,17 @@ struct OffsetM {
 impl OffsetM {
     fn new(s: &Session) -> Self {
         let _ = s;
-        OffsetM { dist: None, through: false, picked: None, ask: None, multiple: false, undo: Vec::new() }
+        OffsetM { dist: None, distance_first: None, through: false, picked: None, ask: None, multiple: false, undo: Vec::new() }
+    }
+
+    fn set_distance(&mut self, s: &mut Session, distance: f64) -> Result<()> {
+        if !(distance.is_finite() && distance > 0.0) {
+            return Err(EngineError::Other("Requires a positive distance.".into()));
+        }
+        s.doc_mut()?.header.set_f64("OFFSETDIST", distance);
+        self.dist = Some(distance);
+        self.distance_first = None;
+        Ok(())
     }
 }
 
@@ -1976,6 +2060,12 @@ impl Interactive for OffsetM {
             None => {}
         }
         let last = s.doc().map(|d| d.header.f64("OFFSETDIST", -1.0)).unwrap_or(-1.0);
+        if self.dist.is_none()
+            && !self.through
+            && let Some(base) = self.distance_first
+        {
+            return Prompt::new("Specify second point", Accept::POINT).base(base);
+        }
         match (self.dist.is_some() || self.through, self.picked) {
             (false, _) => Prompt::new("Specify offset distance", Accept::POINT_OR_NUMBER).kw(&["Through", "Erase", "Layer"]).default(if last < 0.0 {
                 "Through".to_string()
@@ -2020,14 +2110,26 @@ impl Interactive for OffsetM {
         if self.dist.is_none() && !self.through {
             match i {
                 Input::Text(t) => {
-                    let d = number(&t).filter(|d| *d > 0.0).ok_or_else(|| EngineError::Other("Requires a positive distance.".into()))?;
-                    self.dist = Some(d);
-                    s.doc_mut()?.header.set_f64("OFFSETDIST", d);
+                    let d = number(&t).ok_or_else(|| EngineError::Other("Requires a positive distance.".into()))?;
+                    self.set_distance(s, d)?;
                 }
-                Input::Keyword(k) if k == "Through" => self.through = true,
+                Input::Point(p) => {
+                    if !p.is_finite() {
+                        return Err(EngineError::Other("Invalid point.".into()));
+                    }
+                    match self.distance_first {
+                        Some(base) => self.set_distance(s, base.dist(p))?,
+                        None => self.distance_first = Some(p),
+                    }
+                }
+                Input::Keyword(k) if k == "Through" => {
+                    self.through = true;
+                    self.distance_first = None;
+                }
                 Input::Keyword(k) if k == "Erase" => self.ask = Some(OffsetAsk::Erase),
                 Input::Keyword(k) if k == "Layer" => self.ask = Some(OffsetAsk::Layer),
                 Input::Enter => {
+                    self.distance_first = None;
                     let last = s.doc()?.header.f64("OFFSETDIST", -1.0);
                     if last > 0.0 {
                         self.dist = Some(last);
@@ -2121,6 +2223,11 @@ impl Interactive for OffsetM {
         }
     }
     fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        if let Some(base) = self.distance_first
+            && c.is_finite()
+        {
+            return vec![line(base, c)];
+        }
         let (Some(h), Ok(d)) = (self.picked, s.doc()) else { return Vec::new() };
         let Some(e) = d.entity(h) else { return Vec::new() };
         let dist = match self.dist {
@@ -2677,6 +2784,12 @@ impl Interactive for DisplaceM {
             return Vec::new();
         }
         self.inner.preview(s, c)
+    }
+    fn drag(&self, s: &Session, c: Vec2) -> Option<crate::prompt::Drag> {
+        if self.displacement {
+            return None;
+        }
+        self.inner.drag(s, c)
     }
 }
 

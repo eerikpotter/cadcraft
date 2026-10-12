@@ -17,10 +17,12 @@ pub mod bidi;
 mod complex;
 mod mtext;
 mod stroke;
+pub mod subset;
 pub mod ttf;
 
 use cadcraft_geom::{Bounds2, Vec2};
 
+pub use mtext::para::{DEFAULT_TAB, ListStyle, MTextColumnSpec, ParaAlign, ParaProps, Paragraphs, TabKind, list_contents};
 pub use mtext::{MTextColor, MTextLayout, MTextParams, MTextPiece, layout_mtext, layout_mtext_with, plain_mtext};
 
 mod craft_fonts;
@@ -130,7 +132,7 @@ pub fn shape_stroke(s: &str, height: f64, width_factor: f64, oblique: f64) -> Sh
                 Some(g) => {
                     let contours = ttf::place_glyph(&g, x, h, wf, shear);
                     if !contours.is_empty() {
-                        out.glyphs.push(contours);
+                        out.push_glyph(contours, ttf::text_glyph(&g, c, x, h, wf, shear));
                     }
                     adv = g.advance * h / g.cap * wf;
                 }
@@ -211,6 +213,17 @@ pub fn line_width(s: &str, height: f64, width_factor: f64) -> f64 {
     (n - stroke::GAP / stroke::CAP * height * width_factor).max(0.0)
 }
 
+/// Width of the gap MTEXT leaves between two words. Words are measured without their trailing
+/// letter gap, so the stroke font's gap is added on both sides of the space, as TEXT lays it out.
+pub fn space_width(font: &TextFont, height: f64, width_factor: f64) -> f64 {
+    if let TextFont::Outline(face) = font
+        && let Some(w) = ttf::width(face, " ", height, width_factor)
+    {
+        return w;
+    }
+    stroke_advance(' ', height, width_factor) + stroke::GAP / stroke::CAP * height * width_factor
+}
+
 /// The font a piece of text is set in: the built-in stroke font or an installed TrueType /
 /// OpenType face (outlines). Either way, characters the font lacks come from a fallback font.
 #[derive(Clone, Debug, Default)]
@@ -241,16 +254,53 @@ impl TextFont {
 
 /// Shaped text in local or world coordinates: open strokes (stroke-font glyphs, underlines,
 /// fraction bars) and closed glyph outlines grouped per glyph (fill each group even-odd).
+/// Outline glyphs also come as [`TextGlyph`]s, for output that keeps text as text (PDF).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Shaped {
     pub strokes: Vec<Vec<Vec2>>,
     pub glyphs: Vec<Vec<Vec<Vec2>>>,
     pub width: f64,
+    /// The outline glyphs as font glyphs: which face and glyph each of [`Shaped::glyphs`] is,
+    /// and where it sits.
+    pub text: Vec<TextGlyph>,
+}
+
+/// A glyph of an installed outline font, placed: its outline is `Shaped::glyphs[outline]`.
+/// Point `(u, v)` of the glyph in em units (1000 font units per em, as PDF glyph space) lands
+/// at `origin + x * u / 1000 + y * v / 1000`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextGlyph {
+    pub face: ttf::Face,
+    /// Glyph id in the face.
+    pub gid: u16,
+    /// The character it shows.
+    pub ch: char,
+    /// Index of its outline in [`Shaped::glyphs`].
+    pub outline: usize,
+    /// The glyph origin (on the baseline).
+    pub origin: Vec2,
+    /// One em along the baseline (width factor applied).
+    pub x: Vec2,
+    /// One em up (obliquing applied).
+    pub y: Vec2,
 }
 
 impl Shaped {
-    /// Apply a point transform to every vertex.
+    /// Add a glyph outline and, when it is a font glyph, its [`TextGlyph`].
+    pub(crate) fn push_glyph(&mut self, contours: Vec<Vec<Vec2>>, text: Option<TextGlyph>) {
+        if let Some(t) = text {
+            self.text.push(TextGlyph { outline: self.glyphs.len(), ..t });
+        }
+        self.glyphs.push(contours);
+    }
+    /// Apply a point transform to every vertex (an affine map: text glyphs keep their axes).
     pub fn map(&mut self, f: impl Fn(Vec2) -> Vec2) {
+        for t in &mut self.text {
+            let o = f(t.origin);
+            t.x = f(t.origin + t.x) - o;
+            t.y = f(t.origin + t.y) - o;
+            t.origin = o;
+        }
         for s in &mut self.strokes {
             for p in s.iter_mut() {
                 *p = f(*p);
@@ -266,6 +316,8 @@ impl Shaped {
     }
     /// Append another shaped piece (already in the same coordinates).
     pub fn extend(&mut self, other: Shaped) {
+        let base = self.glyphs.len();
+        self.text.extend(other.text.into_iter().map(|t| TextGlyph { outline: t.outline + base, ..t }));
         self.strokes.extend(other.strokes);
         self.glyphs.extend(other.glyphs);
     }

@@ -53,6 +53,9 @@ pub fn specs() -> Vec<CommandSpec> {
         extract::dataextraction_spec(),
         extract::eattext_spec(),
     ]
+    .into_iter()
+    .chain(xref::specs())
+    .collect()
 }
 
 fn valid_block_name(n: &str) -> bool {
@@ -222,7 +225,9 @@ fn run_insert(s: &mut Session, p: &Value) -> Result<Value> {
     let vals = p.get("attribs").and_then(Value::as_object).cloned().unwrap_or_default();
     let h = insert_with(s, &name, at, scale, rot, point_param(p, "basePoint"), &vals)?;
     if bool_or(p, "explode", false) {
-        return s.execute("explode", &json!({ "handles": [h.hex()] }));
+        // The EXPLODE command body, not `execute`: INSERT records the one undo step.
+        let explode = find_command("explode").ok_or_else(|| EngineError::UnknownCommand("explode".into()))?;
+        return (explode.run)(s, &json!({ "handles": [h.hex()] }));
     }
     Ok(attedit::with_unknown_tags(s, h, &vals, json!({ "handle": h.hex() })))
 }
@@ -418,6 +423,7 @@ impl BlockM {
 }
 
 mod insert_file;
+pub(crate) mod xref;
 
 /// Where the command-line INSERT is in its prompt sequence.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

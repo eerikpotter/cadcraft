@@ -84,6 +84,20 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
     let from = *grips.get(index)?;
     let delta = to - from;
     let mut k = kind.clone();
+    // The further parts of a broken table move on their own.
+    if index > 0
+        && let EntityKind::Table(t) = &mut k
+        && let Some(b) = &mut t.breaks
+    {
+        let i = index - 1;
+        if b.offsets.len() <= i {
+            b.offsets.resize(i + 1, Vec2::ZERO);
+        }
+        if let Some(o) = b.offsets.get_mut(i) {
+            *o += delta;
+        }
+        return Some(k);
+    }
     match &mut k {
         EntityKind::Line(l) => match index {
             0 => set_xy(&mut l.a, to),
@@ -184,6 +198,19 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
                 *sp = sp.refit(&fit, sp.closed);
             }
         }
+        // Centre, base radius (and start angle), top radius.
+        EntityKind::Helix(h) => match index {
+            0 => return Some(translated(kind, delta)),
+            1 => {
+                let r = h.center.xy().dist(to);
+                if r <= EPS {
+                    return None;
+                }
+                h.base_radius = r;
+                h.start_angle = h.center.xy().angle_to(to);
+            }
+            _ => h.top_radius = h.center.xy().dist(to),
+        },
         EntityKind::Ray(r) | EntityKind::XLine(r) => {
             if index == 0 {
                 return Some(translated(kind, delta));
@@ -224,6 +251,7 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
             d.block = None;
         }
         EntityKind::Leader(l) => set_xy(l.vertices.get_mut(index)?, to),
+        EntityKind::MLine(m) => set_xy(&mut m.vertices.get_mut(index)?.p, to),
         EntityKind::MLeader(m) => {
             let mut idx = 0usize;
             let mut done = false;
@@ -253,6 +281,7 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
         }
         EntityKind::Solid(s) | EntityKind::Trace(s) => set_xy(s.corners.get_mut(index)?, to),
         EntityKind::Face3d(f) => set_xy(f.corners.get_mut(index)?, to),
+        EntityKind::Region(_) => return Some(translated(kind, delta)),
         EntityKind::Viewport(v) => {
             let opposite = *grips.get((index + 2) % 4)?;
             let w = (to.x - opposite.x).abs();

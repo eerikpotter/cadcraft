@@ -519,6 +519,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "basic-udev"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a45f9771ced8a774de5e5ebffbe520f52e3943bf5a9a6baa3a5d14a5de1afe6"
+
+[[package]]
 name = "binrw"
 version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -702,13 +708,14 @@ dependencies = [
 
 [[package]]
 name = "cadcraft"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-engine",
  "cadcraft-io",
  "cadcraft-ui-egui",
  "eframe",
  "egui",
+ "hidapi",
  "log",
  "muda",
  "rfd",
@@ -716,11 +723,12 @@ dependencies = [
  "sys-locale",
  "winit",
  "winresource",
+ "zbus",
 ]
 
 [[package]]
 name = "cadcraft-cli"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-engine",
  "cadcraft-io",
@@ -731,14 +739,14 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-color"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "cadcraft-constraints"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-doc",
  "cadcraft-geom",
@@ -748,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-doc"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-color",
  "cadcraft-geom",
@@ -759,21 +767,23 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-dwg"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "acadrust",
 ]
 
 [[package]]
 name = "cadcraft-dxf"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
+ "encoding_rs",
+ "log",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "cadcraft-engine"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-color",
  "cadcraft-constraints",
@@ -781,6 +791,7 @@ dependencies = [
  "cadcraft-dxf",
  "cadcraft-fonts",
  "cadcraft-geom",
+ "cadcraft-io",
  "cadcraft-render",
  "log",
  "rstar",
@@ -791,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-fonts"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-geom",
  "harfrust",
@@ -801,22 +812,24 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-geom"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "cadcraft-io"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-color",
  "cadcraft-doc",
  "cadcraft-dwg",
  "cadcraft-dxf",
+ "cadcraft-fonts",
  "cadcraft-geom",
  "cadcraft-render",
  "miniz_oxide 0.8.9",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -824,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-mcp"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-engine",
  "cadcraft-io",
@@ -835,19 +848,21 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-render"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-color",
  "cadcraft-doc",
  "cadcraft-fonts",
  "cadcraft-geom",
+ "lyon_tessellation",
+ "rayon",
  "serde_json",
  "tiny-skia",
 ]
 
 [[package]]
 name = "cadcraft-ui-egui"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-color",
  "cadcraft-doc",
@@ -868,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-web"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "cadcraft-engine",
  "cadcraft-io",
@@ -935,9 +950,9 @@ dependencies = [
 
 [[package]]
 name = "candid"
-version = "0.10.37"
+version = "0.10.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4dda5edb2bfa2d7703219ba0fd6ec712343fcd03867b76b87405feaa9aae7a0"
+checksum = "88bc8f82a82e71cc997491ce7a019e503d404e6c41c45a364118173facf0fa50"
 dependencies = [
  "anyhow",
  "binrw",
@@ -958,9 +973,9 @@ dependencies = [
 
 [[package]]
 name = "candid_derive"
-version = "0.10.37"
+version = "0.10.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45e094bb111b7a9b70174aaa66f80f1a6751a2e66d2a99eef797c8ab6d0933d3"
+checksum = "228fecfdfd310928426a71a25bc359414e827f9106665120c2cccf63bc5ab499"
 dependencies = [
  "lazy_static",
  "proc-macro2",
@@ -1907,6 +1922,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
+name = "float_next_after"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2413,6 +2434,21 @@ name = "hex-literal"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
+
+[[package]]
+name = "hidapi"
+version = "2.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6"
+dependencies = [
+ "basic-udev",
+ "cc",
+ "cfg-if",
+ "libc",
+ "nix",
+ "pkg-config",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "hkdf"
@@ -3155,6 +3191,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lyon_geom"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4336502e29e32af93cf2dad2214ed6003c17ceb5bd499df77b1de663b9042b92"
+dependencies = [
+ "arrayvec 0.7.8",
+ "euclid",
+ "num-traits",
+]
+
+[[package]]
+name = "lyon_path"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e"
+dependencies = [
+ "lyon_geom",
+ "num-traits",
+]
+
+[[package]]
+name = "lyon_tessellation"
+version = "1.0.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43b8dcf906637ecef61b3c0740c7a4e7f27caeb31257cfac0cc579ce15be6005"
+dependencies = [
+ "float_next_after",
+ "lyon_path",
+ "num-traits",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3328,6 +3396,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -6642,7 +6722,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "serde_json",
 ]

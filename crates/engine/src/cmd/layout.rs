@@ -34,7 +34,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("mview", "Viewports", run_mview)
             .alias(&["mv"])
             .params(
-                "{option?: fit|polygonal|object|on|off|lock|restore, p1?, p2? (default: printable area), count?: 1-4, arrangement?: vertical|horizontal|left|right|above|below, points?: [[x,y]…] + bulges? (polygonal), object? (closed object to clip by), handles? + locked? (on/off/lock), layout?}",
+                "{option?: fit|polygonal|object|on|off|lock|restore, p1?, p2? (default: printable area), count?: 1-4, arrangement?: vertical|horizontal|left|right|above|below, points?: [[x,y]…] + bulges? (polygonal), object? (closed object to clip by), handles? + locked? (on/off/lock), name? (restore: a model space viewport configuration, default *Active; its viewports fill p1-p2 or the printable area), layout?}",
             )
             .interactive(|_| Ok(Box::new(MviewM::new(1, true)))),
         CommandSpec::new("mview.polygonal", "Polygonal Viewport", |s, p| run_mview(s, &viewports::with(p.clone(), "option", json!("polygonal"))))
@@ -74,15 +74,15 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("pagesetup", "Page Setup Manager...", run_pagesetup)
             .menu(&["File", "Page Setup Manager..."])
             .params(
-                "{layout?: current, paper?: \"A4\"|\"A3\"|\"Letter\"|\"ANSI B\"|…, width?, height? (mm), landscape?, margins?: [l,b,r,t] mm, lineweights?, plotArea?, scale?, scaleToFit?, center?, plotStyleTable?: \"monochrome.ctb\"|\"grayscale.ctb\"|\"default.ctb\"|\"None\"|…, displayPlotStyles?: bool}",
+                "{layout?: current, device?: plotter name (PLOTTERMANAGER) | \"None\", paper?: the device's paper | \"A4\"|\"A3\"|\"Letter\"|\"ANSI B\"|…, width?, height? (mm), landscape?, margins?: [l,b,r,t] mm, lineweights?, plotArea?, scale?, scaleToFit?, center?, plotStyleTable?: \"monochrome.ctb\"|\"grayscale.ctb\"|\"default.ctb\"|\"None\"|…, displayPlotStyles?: bool}",
             ),
-        CommandSpec::new("plot", "Print...", |s, p| run_plot(s, p, "plot"))
+        CommandSpec::new("plot", "Print...", |s, p| run_plot(s, &super::plotters::plot_options(s, p, "plot")?, "plot"))
             .menu(&["File", "Print..."])
             .key("Cmd+P")
             .alias(&["print"])
             .params("{path? (else returns base64 `data`), layout?: current|\"Model\", paper?, landscape?, fit?: bool, scale?: number | \"1:50\", lineweights?: bool, plotArea?: extents|display|limits|window (Model) | layout, window?: [[x1,y1],[x2,y2]]} (typed or from the menu: the Plot dialog)")
             .noundo(),
-        CommandSpec::new("exportpdf", "Export to PDF...", |s, p| run_plot(s, p, "exportpdf"))
+        CommandSpec::new("exportpdf", "Export to PDF...", |s, p| run_plot(s, &super::plotters::plot_options(s, p, "exportpdf")?, "exportpdf"))
             .menu(&["File", "Export to PDF..."])
             .params("{path? (else returns base64 `data`), layout?, paper?, landscape?, fit?, scale?, lineweights?, plotArea?, window?} (as PLOT)")
             .noundo(),
@@ -94,6 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
     .into_iter()
     .chain(plotstyle::specs())
+    .chain(super::plotters::specs())
     .collect()
 }
 
@@ -620,6 +621,7 @@ fn run_viewport_set(s: &mut Session, p: &Value) -> Result<Value> {
 fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "pagesetup";
     let keys = [
+        "device",
         "paper",
         "width",
         "height",
@@ -649,10 +651,13 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
             "layouts": d.layouts.iter().map(|l| json!({"name": l.name, "page": serde_json::to_value(&l.page).unwrap_or(Value::Null)})).collect::<Vec<_>>(),
             "papers": cadcraft_render::PAPER_SIZES.iter().map(|p| p.name).collect::<Vec<_>>(),
             "plotStyleTables": cadcraft_doc::BUILTIN_PLOT_STYLE_TABLES,
+            "devices": super::plotters::device_names(),
         }));
     };
     let mut page = s.doc()?.layout(&name).map(|l| l.page.clone()).unwrap_or_default();
-    if let Some(paper) = p.get("paper") {
+    // A plotter's own papers (with their printable areas) come first.
+    let device_paper = super::plotters::page_device(cmd, p, &mut page)?;
+    if let Some(paper) = p.get("paper").filter(|_| !device_paper) {
         let n = paper.as_str().ok_or_else(|| bad(cmd, "`paper` must be a paper name"))?;
         let ps = cadcraft_render::paper_size(n).ok_or_else(|| {
             let known: Vec<&str> = cadcraft_render::PAPER_SIZES.iter().filter_map(|p| p.aliases.first().copied()).collect();
@@ -699,6 +704,10 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
         if !["layout", "extents", "display", "window", "limits"].contains(&v.as_str()) {
             return Err(bad(cmd, "`plotArea` must be layout, extents, display, window or limits"));
         }
+        // Layout plotting always prints the whole sheet; the other areas are only stored for DXF round trips.
+        if v != "layout" && v != page.plot_area {
+            return Err(bad(cmd, format!("plot area `{v}` is not available yet; layouts plot the whole sheet (`layout`)")));
+        }
         page.plot_area = v;
     }
     if let Some(v) = str_param(p, "plotStyleTable") {
@@ -718,8 +727,47 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- plotting ----------
 
+/// Most sheets in one plot (the PDF writer's own limit, `cadcraft_io::pdf::MAX_PAGES`).
+const MAX_PLOT_SHEETS: usize = 256;
+
+/// The sheets of a multi-sheet plot, as canonical names: the `layouts` list (`"Model"` or layout
+/// names, any case) or `"all"` (Model if it has objects, then every layout in tab order).
+fn plot_sheets(cmd: &str, d: &cadcraft_doc::Drawing, v: &Value) -> Result<Vec<String>> {
+    let names: Vec<String> = match v {
+        Value::String(a) if a.eq_ignore_ascii_case("all") => {
+            let mut layouts: Vec<_> = d.layouts.iter().collect();
+            layouts.sort_by_key(|l| l.tab_order);
+            let model = (!d.model.is_empty()).then(|| "Model".to_string());
+            model.into_iter().chain(layouts.iter().map(|l| l.name.clone())).collect()
+        }
+        Value::Array(a) => a
+            .iter()
+            .map(|n| match n.as_str() {
+                Some(n) if n.eq_ignore_ascii_case("model") => Ok("Model".to_string()),
+                Some(n) => layout_name(cmd, d, n),
+                None => Err(bad(cmd, "`layouts` must be a list of layout names or \"all\"")),
+            })
+            .collect::<Result<_>>()?,
+        _ => return Err(bad(cmd, "`layouts` must be a list of layout names or \"all\"")),
+    };
+    if names.is_empty() {
+        return Err(bad(cmd, "there are no sheets to plot"));
+    }
+    if names.len() > MAX_PLOT_SHEETS {
+        return Err(bad(cmd, format!("at most {MAX_PLOT_SHEETS} sheets fit in one PDF")));
+    }
+    Ok(names)
+}
+
+/// PLOT / EXPORTPDF. Besides the page setup overrides, the plotter takes `layouts?: [name |
+/// "Model"] | "all"` (several sheets in one PDF, one page each, labelled with the layout names),
+/// `layers?: bool` (drawing layers as PDF layers, default on), `offLayers?: bool` (layers that
+/// are off on hidden PDF layers), `links?: [{handle, url}]` (hyperlinks) and `title?`.
 fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     let hook = io().and_then(|h| h.plot).ok_or_else(|| bad(cmd, "plotting is not available in this build"))?;
+    // Checked here for a clear error; the plotter resolves the names the same way.
+    let sheets = p.get("layouts").map(|v| plot_sheets(cmd, s.doc()?, v)).transpose()?;
+
     let space = match str_param(p, "layout") {
         Some(n) if n.eq_ignore_ascii_case("model") => Space::Model,
         Some(n) => Space::Paper(layout_name(cmd, s.doc()?, n)?),
@@ -736,10 +784,12 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         }
     }
     let bytes = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
-    let layout = match &space {
-        Space::Model => "Model".to_string(),
-        Space::Paper(n) => n.clone(),
+    let layout = match (&sheets, &space) {
+        (Some(names), _) => names.first().cloned().unwrap_or_default(),
+        (None, Space::Model) => "Model".to_string(),
+        (None, Space::Paper(n)) => n.clone(),
     };
+    let pages = sheets.as_ref().map_or(1, Vec::len);
     match str_param(p, "path") {
         Some(_path) => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -748,12 +798,12 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
                 let tmp = format!("{path}.cadcraft-tmp");
                 std::fs::write(&tmp, &bytes).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
                 std::fs::rename(&tmp, path).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
-                Ok(json!({ "path": path, "bytes": bytes.len(), "layout": layout }))
+                Ok(json!({ "path": path, "bytes": bytes.len(), "layout": layout, "pages": pages }))
             }
             #[cfg(target_arch = "wasm32")]
             Err(bad(cmd, "paths are not available on the web; omit `path` to get the PDF as base64 `data`"))
         }
-        None => Ok(json!({ "data": base64_encode(&bytes), "bytes": bytes.len(), "layout": layout })),
+        None => Ok(json!({ "data": base64_encode(&bytes), "bytes": bytes.len(), "layout": layout, "pages": pages })),
     }
 }
 
@@ -970,6 +1020,12 @@ mod tests {
         assert!(s.execute("pagesetup", &json!({"layout": "Layout1", "margins": [1, 2]})).is_err());
         assert!(s.execute("pagesetup", &json!({"layout": "Layout1", "width": 1e308, "height": 5})).is_err());
         assert!(s.execute("pagesetup", &json!({"paper": "A4"})).is_err(), "model tab needs a layout");
+        for area in ["extents", "display", "window", "limits"] {
+            let e = s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": area})).unwrap_err();
+            assert!(e.to_string().contains("not available yet"), "{area}: {e}");
+        }
+        let r = s.execute("pagesetup", &json!({"layout": "Layout1", "plotArea": "Layout"})).unwrap();
+        assert_eq!(r["page"]["plotArea"], "layout");
         let report = s.execute("pagesetup", &Value::Null).unwrap();
         assert!(report["papers"].as_array().unwrap().len() >= 10);
         s.execute("pagesetup", &json!({"layout": "Layout2", "width": 500, "height": 300})).unwrap();

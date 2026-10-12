@@ -17,16 +17,22 @@ const SESSION_VARS: &[&str] = &[
     "POLARDIST",
     "SNAPTYPE",
     "AUTOSNAP",
+    "QNEWTEMPLATE",
     "GRIDMODE",
     "SNAPMODE",
+    "SNAPSTYL",
+    "SNAPISOPAIR",
     "SNAPUNIT",
     "GRIDUNIT",
     "UNDOCTL",
     "UNDOMARKS",
     "GRIDMAJOR",
+    "DYNDIGRIP",
+    "DYNDIVIS",
     "DYNMODE",
     "DYNPIFORMAT",
     "DYNPICOORDS",
+    "DYNPROMPT",
     "LWDISPLAY",
     "SELECTSIMILARMODE",
     "OBJECTISOLATIONMODE",
@@ -67,12 +73,20 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "POLARANG" => json!(st.polarang.to_degrees()),
         "GRIDMODE" => json!(i32::from(st.gridmode)),
         "SNAPMODE" => json!(i32::from(st.snapmode)),
-        "SNAPUNIT" => json!([st.snapunit.x, st.snapunit.y]),
-        "GRIDUNIT" => json!([st.gridunit.x, st.gridunit.y]),
+        "SNAPSTYL" => json!(i32::from(st.isodraft)),
+        "SNAPISOPAIR" => json!(st.isoplane.index()),
+        "SNAPUNIT" | "GRIDUNIT" => {
+            let settings = s.drafting_settings();
+            let unit = if n == "SNAPUNIT" { settings.snapunit } else { settings.gridunit };
+            json!([unit.x, unit.y])
+        }
         "GRIDMAJOR" => json!(st.gridmajor),
+        "DYNDIGRIP" => json!(st.dyndigrip),
+        "DYNDIVIS" => json!(st.dyndivis),
         "DYNMODE" => json!(i32::from(st.dynmode)),
         "DYNPIFORMAT" => json!(i32::from(st.dynpi_cartesian)),
         "DYNPICOORDS" => json!(i32::from(st.dynpi_absolute)),
+        "DYNPROMPT" => json!(i32::from(st.dynprompt)),
         "LWDISPLAY" => json!(i32::from(st.lwdisplay)),
         "SELECTSIMILARMODE" => json!(st.selectsimilarmode),
         // Isolation is temporary: hidden objects show again when the drawing is reopened.
@@ -90,6 +104,7 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "LASTPOINT" => json!([s.last_point.x, s.last_point.y, 0.0]),
         // Held in radians (as `$ANGBASE` in DXF); reported in degrees, like POLARANG.
         "ANGBASE" => json!(s.doc().ok()?.header.f64("ANGBASE", 0.0).to_degrees()),
+        "CONSTRAINTINFER" => json!(i32::from(s.doc().ok()?.parametric.settings.infer)),
         // Process-wide font substitution (profile settings, not saved in the drawing).
         "FONTALT" => json!(cadcraft_fonts::ttf::font_alt()),
         "FONTFALLBACK" => json!(cadcraft_fonts::ttf::fallback_fonts()),
@@ -99,6 +114,8 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "CMDNAMES" => json!(s.running.as_ref().map(|r| r.id.to_ascii_uppercase()).unwrap_or_default()),
         "DWGNAME" => json!(s.state().map(|d| d.title.clone()).unwrap_or_default()),
         "DBMOD" => json!(s.state().map(|d| i32::from(d.is_dirty())).unwrap_or(0)),
+        // The template NEW/QNEW start from (a profile setting, like FONTALT; "" = none).
+        "QNEWTEMPLATE" => json!(crate::cmd::file::qnew_template()),
         "CTAB" => json!(
             s.state()
                 .map(|d| match &d.space {
@@ -201,15 +218,25 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
             st.polarmode = bits & 8 != 0;
             st.otrack = bits & 16 != 0;
         }
+        "QNEWTEMPLATE" => crate::cmd::file::set_qnew_template(v.as_str().ok_or_else(bad)?),
         "POLARANG" => st.polarang = as_f64(v).filter(|a| *a > 0.0).ok_or_else(bad)?.to_radians(),
         "GRIDMODE" => st.gridmode = as_bool(v).ok_or_else(bad)?,
         "SNAPMODE" => st.snapmode = as_bool(v).ok_or_else(bad)?,
-        "SNAPUNIT" => st.snapunit = as_pt(v).filter(|p| p.x > 0.0 && p.y > 0.0).ok_or_else(bad)?,
-        "GRIDUNIT" => st.gridunit = as_pt(v).filter(|p| p.x > 0.0 && p.y > 0.0).ok_or_else(bad)?,
+        "SNAPSTYL" => st.isodraft = as_i(v).filter(|b| (0..=1).contains(b)).ok_or_else(bad)? == 1,
+        "SNAPISOPAIR" => st.isoplane = as_i(v).and_then(crate::snap::iso::IsoPlane::from_index).ok_or_else(bad)?,
+        "SNAPUNIT" | "GRIDUNIT" => {
+            let unit = as_pt(v)
+                .filter(|p| p.is_finite() && if n == "GRIDUNIT" { p.x >= 0.0 && p.y >= 0.0 } else { p.x > 0.0 && p.y > 0.0 })
+                .ok_or_else(bad)?;
+            s.doc_mut()?.header.set(&n, cadcraft_doc::HVal::Point(unit.to3(0.0)));
+        }
         "GRIDMAJOR" => st.gridmajor = as_f64(v).ok_or_else(bad)?.clamp(1.0, 100.0) as u32,
+        "DYNDIGRIP" => st.dyndigrip = as_i(v).filter(|i| (0..=31).contains(i)).and_then(|i| u32::try_from(i).ok()).ok_or_else(bad)?,
+        "DYNDIVIS" => st.dyndivis = as_i(v).filter(|i| (0..=2).contains(i)).and_then(|i| u8::try_from(i).ok()).ok_or_else(bad)?,
         "DYNMODE" => st.dynmode = as_bool(v).ok_or_else(bad)?,
         "DYNPIFORMAT" => st.dynpi_cartesian = as_bool(v).ok_or_else(bad)?,
         "DYNPICOORDS" => st.dynpi_absolute = as_bool(v).ok_or_else(bad)?,
+        "DYNPROMPT" => st.dynprompt = as_bool(v).ok_or_else(bad)?,
         "LWDISPLAY" => st.lwdisplay = as_bool(v).ok_or_else(bad)?,
         "SELECTSIMILARMODE" => st.selectsimilarmode = as_i(v).filter(|b| (0..=255).contains(b)).ok_or_else(bad)? as u32,
         "OBJECTISOLATIONMODE" => match as_i(v) {
@@ -242,6 +269,7 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
             let a = a.filter(|a| a.is_finite()).ok_or_else(bad)?;
             s.doc_mut()?.header.set_f64("ANGBASE", cadcraft_geom::norm_angle(a));
         }
+        "CONSTRAINTINFER" => s.doc_mut()?.parametric.settings.infer = as_bool(v).ok_or_else(bad)?,
         _ => {
             if let Some(r) = table::set(s, &n, v) {
                 return r;
@@ -258,7 +286,7 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
                     },
                 },
                 Value::Bool(b) => cadcraft_doc::HVal::Int(i64::from(*b)),
-                Value::Array(_) => cadcraft_doc::HVal::Point(as_pt(v).ok_or_else(bad)?.to3(0.0)),
+                Value::Array(_) | Value::Object(_) => cadcraft_doc::HVal::Point(as_pt(v).ok_or_else(bad)?.to3(0.0)),
                 _ => return Err(bad()),
             };
             // Keep the header type stable for known numeric vars.
@@ -274,6 +302,16 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
                         _ => return Err(bad()),
                     };
                     d.header.set_i64(&n, i);
+                    return Ok(());
+                }
+                // A text variable (CLAYER...) keeps what was typed, so a layer named `10` stays a string.
+                Some(cadcraft_doc::HVal::Str(_)) => {
+                    let text = match v {
+                        Value::String(t) => t.clone(),
+                        Value::Number(x) => x.to_string(),
+                        _ => return Err(bad()),
+                    };
+                    d.header.set(&n, cadcraft_doc::HVal::Str(text));
                     return Ok(());
                 }
                 // A point variable takes `x,y` typed at the command line too.
@@ -298,7 +336,7 @@ pub fn list(s: &Session) -> Value {
     }
     if let Ok(d) = s.doc() {
         for (k, v) in &d.header.vars {
-            if k == "ANGBASE" {
+            if matches!(k.as_str(), "ANGBASE" | "SNAPUNIT" | "GRIDUNIT") {
                 m.insert(k.clone(), get(s, k).unwrap_or(Value::Null));
             } else if !k.starts_with("CADCRAFT_") {
                 m.insert(k.clone(), serde_json::to_value(v).unwrap_or(Value::Null));

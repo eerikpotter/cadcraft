@@ -10,14 +10,19 @@ pub const MENUS: &[&str] = &["File", "Edit", "View", "Insert", "Format", "Tools"
 
 /// UI-only commands: (id, label, menu path, shortcut).
 pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    ("ui.spacemouse", "3D Mouse...", &["Tools", "3D Mouse..."], None),
+    ("ui.spacemouse.calibrate", "Calibrate 3D Mouse", &[], None),
+    ("ui.spacemouse.navigate", "3D Mouse Navigation", &[], None),
     ("ui.dock", "Arrange Panel", &[], None),
     ("ui.dock.reset", "Reset Panel Layout", &["Window", "Reset Panel Layout"], None),
     ("ui.open", "Open...", &[], Some("Cmd+O")),
+    ("ui.newtemplate", "New from Template...", &["File", "New from Template..."], None),
     ("ui.saveas", "Save As...", &[], None),
     ("ui.sample", "Open Sample Drawing", &["Help", "Open Sample Drawing"], None),
     ("ui.toggle.toolsets", "Tool Sets", &["Window", "Tool Sets"], Some("Cmd+3")),
     ("ui.panel.properties", "Properties Inspector", &["Window", "Properties Inspector"], Some("Cmd+1")),
     ("ui.panel.layers", "Layers Palette", &["Window", "Layers Palette"], None),
+    ("ui.panel.quickcalc", "QuickCalc", &["Window", "QuickCalc"], Some("Cmd+8")),
     ("ui.toggle.systemcursor", "Show System Cursor", &["View", "Accessibility", "Show System Cursor"], None),
     ("ui.toggle.toolbar", "Tool Bar", &["Window", "Tool Bar"], None),
     ("ui.toggle.filetabs", "File Tab", &["Window", "File Tab"], None),
@@ -52,6 +57,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.dialog.commands", "Command Reference", &["Help", "CADCraft Help"], Some("F1")),
     ("ui.toggle.history", "Command History", &["Window", "Command History"], Some("F2")),
     ("ui.cmdline.lines", "Command Line History Lines", &[], None),
+    ("ui.cmdline.clear", "Clear Command History", &[], None),
     ("ui.dialog.language", "Interface Language", &["Edit", "Interface Language"], None),
     ("ui.language", "Language", &[], None),
     ("ui.noop", "", &[], None),
@@ -68,6 +74,12 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value) -> Option<Resu
 }
 
 fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if let Some(result) = crate::spacemouse::route(app, id, params) {
+        return Some(result);
+    }
+    if let Some(r) = crate::xrefs::route(app, id, params) {
+        return Some(r);
+    }
     if let Some(r) = crate::managers::route(app, id, params) {
         return Some(r);
     }
@@ -78,7 +90,14 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         let panel = if id == "ui.panel.properties" { "properties" } else { "layers" };
         return Some(crate::docking::command(app, false, &json!({"operation":"open", "panel":panel})));
     }
+    // QUICKCALC typed or from a menu opens the palette; with parameters it is CAL.
+    if id == "ui.panel.quickcalc" || (matches!(id, "quickcalc" | "qc") && params.is_null()) {
+        return Some(crate::palettes::quickcalc::open(app));
+    }
     if let Some(r) = crate::plotstyles::route(app, id, params) {
+        return Some(r);
+    }
+    if let Some(r) = crate::options::route(app, id, params) {
         return Some(r);
     }
     let toggle = |b: &mut bool, p: &Value| {
@@ -92,15 +111,28 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
     let r = match id {
         "ui.language" => {
             let Some(preference) = params.get("lang").and_then(Value::as_str).and_then(crate::i18n::Preference::parse) else {
-                return Some(Err("language must be auto, en or uk".into()));
+                return Some(Err(format!("language must be {}", crate::i18n::Preference::codes())));
             };
             app.ui.interface_language = preference;
-            Ok(json!({"interfaceLanguage": preference.code()}))
+            let shown = app.language();
+            if shown != preference.resolve(&app.system_languages) {
+                app.set_status(
+                    "No Chinese font is installed, so the interface stays in English. Install one (Noto Sans CJK, for example) to use Chinese.",
+                );
+            }
+            Ok(json!({"interfaceLanguage": preference.code(), "shown": shown}))
         }
         "ui.open" | "open" if no_path => {
             let picked = app.services.pick_open.as_ref().and_then(|f| f());
             if let Some(p) = picked {
                 app.open_path(&p);
+            }
+            Ok(Value::Null)
+        }
+        // Pick a template (.dwt or .dxf) and start a new drawing from it.
+        "ui.newtemplate" => {
+            if let Some(p) = app.services.pick_open.as_ref().and_then(|f| f()) {
+                return Some(app.session.execute("new", &json!({ "template": p })).map_err(|e| e.to_string()));
             }
             Ok(Value::Null)
         }
@@ -262,6 +294,10 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
                 app.ui.history_lines = n.min(crate::cmdline::MAX_LINES as u64) as usize;
             }
             Ok(json!({ "lines": app.ui.history_lines }))
+        }
+        "ui.cmdline.clear" => {
+            app.session.log.clear();
+            Ok(Value::Null)
         }
         "ui.dialog.language"
         | "ui.dialog.layers"
@@ -432,7 +468,7 @@ pub(crate) fn entry_ui(ui: &mut egui::Ui, e: &Entry, clicked: &mut Option<String
             }
         }
         Entry::Sub { label, children } => {
-            ui.menu_button(crate::i18n::t(label), |ui| {
+            ui.menu_button(crate::i18n::menu(label), |ui| {
                 for c in children {
                     entry_ui(ui, c, clicked);
                 }
@@ -450,7 +486,7 @@ pub fn menu_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 for (name, entries) in &tree {
-                    ui.menu_button(crate::i18n::t(name), |ui| {
+                    ui.menu_button(crate::i18n::menu(name), |ui| {
                         for e in entries {
                             entry_ui(ui, e, &mut clicked);
                         }
@@ -503,6 +539,8 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         (sc(Modifiers::NONE, Key::F1), "ui.dialog.commands"),
         (sc(Modifiers::NONE, Key::F2), "ui.toggle.history"),
         (sc(Modifiers::NONE, Key::F3), "osnap"),
+        (sc(Modifiers::NONE, Key::F5), "isoplane"),
+        (sc(cmd, Key::E), "isoplane"),
         (sc(Modifiers::NONE, Key::F7), "grid"),
         (sc(Modifiers::NONE, Key::F8), "ortho"),
         (sc(Modifiers::NONE, Key::F9), "snap"),
@@ -524,6 +562,13 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         }
     });
     for id in fire {
+        // ISOPLANE (F5, Ctrl+E) switches the plane without cancelling the active command.
+        if id == "isoplane" {
+            if let Some(m) = app.session.execute(id, &json!({})).ok().and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string)) {
+                app.session.echo(m);
+            }
+            continue;
+        }
         // Toggles run transparently (they don't cancel the active command).
         let transparent = ["osnap", "grid", "ortho", "snap", "polar", "otrack", "dynmode", "pickstyle"].contains(&id);
         if transparent || id.starts_with("ui.") {

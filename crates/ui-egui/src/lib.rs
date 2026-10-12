@@ -19,18 +19,24 @@ pub mod control;
 pub mod credits;
 pub mod dialogs;
 pub mod docking;
+pub mod spacemouse;
+// The External References palette.
+pub mod xrefs;
 
 pub mod dyninput;
 pub mod gpu;
+pub mod grip_dyn;
 pub mod i18n;
 pub mod icons;
 pub mod layers;
 pub mod managers;
 pub mod menus;
+pub mod options;
 pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;
 pub mod quick;
+pub mod shortcut_menus;
 pub mod theme;
 pub mod viewcube;
 pub mod vpscale;
@@ -72,6 +78,9 @@ pub struct UiState {
     /// "Drafting" or "Modeling".
     pub toolset_tab: String,
     pub collapsed_groups: Vec<String>,
+    /// Tools the user took out of the Tool Sets palette (command ids); each category's gear
+    /// menu puts them back.
+    pub hidden_tools: Vec<String>,
     pub properties_all: bool,
     /// Show an in-window menu bar (platforms without a native menu bar, or on request).
     pub in_window_menu: bool,
@@ -145,6 +154,7 @@ impl Default for UiState {
             system_cursor: std::env::var("CADCRAFT_SYSTEM_CURSOR").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "false" | "off")),
             toolset_tab: "Drafting".into(),
             collapsed_groups: Vec::new(),
+            hidden_tools: Vec::new(),
             properties_all: true,
             in_window_menu: !cfg!(target_os = "macos"),
             start_tab: false,
@@ -171,8 +181,12 @@ pub struct CadApp {
     pub system_languages: Vec<String>,
     pub session: Session,
     pub ui: UiState,
+    /// The interface's own preferences from the Options dialog ([`options`]).
+    pub options: options::UiOptions,
     pub services: Services,
     pub canvas: canvas::CanvasState,
+    /// Desktop HID status and navigation preferences; the web host supplies no HID backend.
+    pub spacemouse: spacemouse::State,
     pub cmd: cmdline::CmdLine,
     pub status: Option<(String, f64)>,
     pub integrated_titlebar: bool,
@@ -184,7 +198,8 @@ pub struct CadApp {
     /// Caps the frame rate when presenting without vsync (see [`gpu::FrameCap`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub frame_cap: Option<gpu::FrameCap>,
-    styled: bool,
+    /// Interface fonts installed, and whether with a CJK font (`None` until the first frame).
+    fonts_cjk: Option<bool>,
     /// The theme last installed into egui (`None` until the first frame).
     shown_theme: Option<egui::Theme>,
     /// Whether the last applied theme was handed to egui as the System preference.
@@ -200,6 +215,10 @@ pub struct CadApp {
     pub autosave: Option<cadcraft_engine::autosave::Autosaver>,
     /// Drawing Recovery: autosave files a crashed app left behind.
     pub recovery: autosave::Recovery,
+    /// GPU errors and device loss reported by wgpu ([`gpu::GpuFaults`]).
+    pub gpu_faults: std::sync::Arc<gpu::GpuFaults>,
+    /// The notice shown after one (see [`autosave::gpu_notice`]).
+    pub gpu_notice: Option<autosave::GpuNotice>,
 }
 
 impl CadApp {
@@ -209,8 +228,10 @@ impl CadApp {
             system_languages: Vec::new(),
             session,
             ui: UiState::default(),
+            options: options::UiOptions::default(),
             services,
             canvas: canvas::CanvasState::default(),
+            spacemouse: spacemouse::State::default(),
             cmd: cmdline::CmdLine::default(),
             status: None,
             integrated_titlebar: false,
@@ -221,7 +242,7 @@ impl CadApp {
             synthetic: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             frame_cap: None,
-            styled: false,
+            fonts_cjk: None,
             shown_theme: None,
             shown_follows_system: false,
             frame_ms: 0.0,
@@ -230,17 +251,22 @@ impl CadApp {
             closing: None,
             autosave: None,
             recovery: autosave::Recovery::default(),
+            gpu_faults: std::sync::Arc::default(),
+            gpu_notice: None,
         }
     }
 
+    /// The interface language shown: the chosen one, or English when this computer has no font
+    /// for it (Chinese without an installed CJK font would be boxes).
     pub fn language(&self) -> &'static str {
-        self.ui.interface_language.resolve(&self.system_languages)
+        let l = self.ui.interface_language.resolve(&self.system_languages);
+        if theme::can_show(l) { l } else { "en" }
     }
 
     /// Draw the canvas on the GPU with the app's wgpu render state (eframe's
     /// `CreationContext::wgpu_render_state`). Without it the canvas draws on the CPU.
     pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState) {
-        self.canvas.gpu = Some(gpu::install(rs));
+        self.canvas.gpu = Some(gpu::install(rs, &self.gpu_faults));
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -300,18 +326,24 @@ impl CadApp {
 
     /// Preferences kept across restarts, as JSON for the host's storage ([`PREFS_KEY`]).
     pub fn prefs_json(&self) -> String {
-        json!({
+        let mut prefs = json!({
             "theme": self.ui.theme.as_str(),
             "interfaceLanguage": self.ui.interface_language.code(),
             "saveFormat": self.ui.save_format.as_str(),
             "saveVersion": self.ui.save_version,
-        })
-        .to_string()
+        });
+        if self.spacemouse.settings != spacemouse::Settings::default() {
+            prefs["spacemouse"] = json!(self.spacemouse.settings);
+        }
+        prefs.to_string()
     }
 
     /// Restore preferences saved by [`Self::prefs_json`]; unknown or malformed values are ignored.
     pub fn load_prefs(&mut self, json: &str) {
         let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+        if let Some(prefs) = v.get("spacemouse") {
+            let _ = self.spacemouse.load_settings(prefs);
+        }
         if let Some(t) = v.get("theme").and_then(Value::as_str).and_then(theme::ThemePref::parse) {
             self.ui.theme = t;
         }
@@ -386,14 +418,16 @@ impl CadApp {
         if ctx.input(|i| i.viewport().close_requested()) && self.request_quit() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if !self.styled {
-            theme::install_fonts(ctx);
-            self.styled = true;
+        let cjk = self.language().starts_with("zh");
+        if self.fonts_cjk != Some(cjk) {
+            theme::install_fonts(ctx, cjk);
+            self.fonts_cjk = Some(cjk);
         }
         // Resolved every frame, so a System choice follows the OS appearance live (winit and the
         // browser report changes as input); the saved choice itself never changes here.
         let shown = self.ui.theme.resolve(ctx.system_theme());
         theme::set_active(shown);
+        theme::set_canvas(self.options.canvas());
         let follows_system = self.ui.theme == theme::ThemePref::System;
         if self.shown_theme != Some(shown) || self.shown_follows_system != follows_system {
             theme::apply(ctx, shown, follows_system);
@@ -406,6 +440,8 @@ impl CadApp {
         }
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
+        self.gpu_fault_tick(ctx);
+        managers::plot_window_resume(self, ctx);
         self.autosave_tick(ctx);
         menus::shortcuts(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
@@ -471,8 +507,10 @@ impl CadApp {
             }
         });
         dialogs::show(self, ui.ctx());
+        palettes::patterns::prompt_picker(self, ui.ctx());
         closing::prompt(self, ui.ctx());
         autosave::show(self, ui.ctx());
+        autosave::gpu_notice(self, ui.ctx());
         self.frame_ms = now_ms() - t0;
     }
 

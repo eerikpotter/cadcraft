@@ -92,6 +92,10 @@ pub struct Tokens {
     pub grip: Color32,
     pub grip_hot: Color32,
     pub snap: Color32,
+    /// COMPARE: objects only in this drawing, only in the other one, and the areas of change.
+    pub compare_this: Color32,
+    pub compare_other: Color32,
+    pub compare_area: Color32,
     pub window_fill: Color32,
     pub crossing_fill: Color32,
     pub window_stroke: Color32,
@@ -118,6 +122,8 @@ pub struct Tokens {
     pub warn: Color32,
     /// The drawing-area crosshair cursor and its pick box.
     pub crosshair: Color32,
+    /// The sheet of paper on a layout tab.
+    pub paper: Color32,
 }
 
 impl Tokens {
@@ -146,6 +152,9 @@ impl Tokens {
         grip: Color32::from_rgb(0x2f, 0x6b, 0xff),
         grip_hot: Color32::from_rgb(0xff, 0x3b, 0x3b),
         snap: Color32::from_rgb(0x2f, 0xd0, 0x62),
+        compare_this: Color32::from_rgb(0x4c, 0xd9, 0x7b),
+        compare_other: Color32::from_rgb(0xff, 0x5c, 0x5c),
+        compare_area: Color32::from_rgb(0xff, 0xb4, 0x3c),
         window_fill: Color32::from_rgba_premultiplied(0x18, 0x30, 0x60, 0x50),
         crossing_fill: Color32::from_rgba_premultiplied(0x18, 0x48, 0x18, 0x50),
         window_stroke: Color32::from_rgb(0x6f, 0xa8, 0xff),
@@ -163,6 +172,7 @@ impl Tokens {
         list_row: Color32::from_rgb(0x3a, 0x42, 0x50),
         warn: Color32::from_rgb(0xff, 0xd0, 0x80),
         crosshair: Color32::from_rgb(0xe8, 0xe8, 0xe8),
+        paper: Color32::WHITE,
     };
 
     /// Light grey chrome with dark text. The drawing-area colours (canvas, grid, axes, selection,
@@ -204,10 +214,81 @@ impl Tokens {
         }
     }
 
-    /// The palette of the theme in use.
+    /// The palette of the theme in use, with the user's drawing-area colours ([`set_canvas`]).
     pub fn get() -> Tokens {
-        Tokens::of(active())
+        CANVAS.with(Cell::get).over(Tokens::of(active()))
     }
+
+    /// These tokens with `bg` as the model-space background: the grid, axes, crosshair and the
+    /// lines drawn on the drawing area are recomputed to stay visible on it.
+    pub fn with_model_background(self, bg: Color32) -> Tokens {
+        let light = luminance(bg) > 0.5;
+        let ink = if light { Color32::BLACK } else { Color32::WHITE };
+        Tokens {
+            canvas: bg,
+            grid_minor: mix(bg, ink, 0.05),
+            grid_major: mix(bg, ink, 0.11),
+            axis_x: mix(bg, Color32::from_rgb(0xd0, 0x30, 0x30), 0.3),
+            axis_y: mix(bg, Color32::from_rgb(0x30, 0xb0, 0x40), 0.3),
+            canvas_ink: if light { Color32::from_rgb(0x47, 0x50, 0x5c) } else { Tokens::DARK.canvas_ink },
+            crosshair: if light { Color32::from_rgb(0x20, 0x20, 0x20) } else { Tokens::DARK.crosshair },
+            ..self
+        }
+    }
+}
+
+/// The user's drawing-area preferences (Options ▸ Display and Drafting); `None` keeps the theme's
+/// colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Canvas {
+    pub model: Option<Color32>,
+    pub paper: Option<Color32>,
+    /// The side of an object snap marker, in points.
+    pub snap_marker: f32,
+}
+
+/// The default object snap marker size.
+pub const SNAP_MARKER: f32 = 11.0;
+
+impl Default for Canvas {
+    fn default() -> Self {
+        Canvas { model: None, paper: None, snap_marker: SNAP_MARKER }
+    }
+}
+
+impl Canvas {
+    fn over(self, t: Tokens) -> Tokens {
+        let t = match self.model {
+            Some(bg) => t.with_model_background(bg),
+            None => t,
+        };
+        Tokens { paper: self.paper.unwrap_or(t.paper), ..t }
+    }
+}
+
+thread_local! {
+    /// The drawing-area preferences in use on the UI thread (set by [`set_canvas`] each frame).
+    static CANVAS: Cell<Canvas> = Cell::new(Canvas::default());
+}
+
+pub fn set_canvas(c: Canvas) {
+    CANVAS.with(|v| v.set(c));
+}
+
+/// Half the side of an object snap marker, in points.
+pub fn snap_marker_half() -> f32 {
+    CANVAS.with(Cell::get).snap_marker / 2.0
+}
+
+/// Relative luminance of `c` (0 black … 1 white).
+pub fn luminance(c: Color32) -> f32 {
+    (0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())) / 255.0
+}
+
+/// `a` moved the fraction `f` towards `b`.
+fn mix(a: Color32, b: Color32, f: f32) -> Color32 {
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * f).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
 pub fn small() -> FontId {
@@ -221,7 +302,7 @@ pub fn mono() -> FontId {
 }
 
 /// Load a system UI font at run time when one is installed (not bundled), else keep egui's.
-pub fn install_fonts(ctx: &egui::Context) {
+pub fn install_fonts(ctx: &egui::Context, cjk: bool) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let candidates: &[&str] = if cfg!(target_os = "macos") {
@@ -246,10 +327,70 @@ pub fn install_fonts(ctx: &egui::Context) {
                 break;
             }
         }
+        // Chinese: an installed CJK font after the Latin ones, so Latin text keeps its look.
+        if let Some(bytes) = cjk.then(cjk_font).flatten().and_then(|p| read_capped(p, MAX_UI_FONT_BYTES)) {
+            fonts.font_data.insert("system-cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                if let Some(f) = fonts.families.get_mut(&family) {
+                    f.push("system-cjk".into());
+                }
+            }
+        }
         ctx.set_fonts(fonts);
     }
     #[cfg(target_arch = "wasm32")]
-    let _ = ctx;
+    let _ = (ctx, cjk);
+}
+
+/// Largest interface font file read (CJK collections are 15–60 MB).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_UI_FONT_BYTES: u64 = 96 * 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_capped(path: &std::path::Path, max: u64) -> Option<Vec<u8>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 || len > max {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// An installed font with Chinese characters, for the Chinese interface; fonts are never bundled
+/// (only looked for where the OS or common packages put them). Checked once.
+pub fn cjk_font() -> Option<&'static std::path::Path> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                let candidates: &[&str] = if cfg!(target_os = "macos") {
+                    &["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc"]
+                } else if cfg!(windows) {
+                    &["C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\msyh.ttf", "C:\\Windows\\Fonts\\simsun.ttc"]
+                } else {
+                    &[
+                        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+                        "/usr/local/share/fonts/noto/NotoSansCJK-Regular.ttc",
+                        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+                        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+                    ]
+                };
+                candidates.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
+            })
+            .as_deref()
+    }
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
+/// Whether the interface can show `language`: Chinese needs an installed CJK font.
+pub fn can_show(language: &str) -> bool {
+    !language.starts_with("zh") || cjk_font().is_some()
 }
 
 /// egui's visuals for `theme`, from its tokens.

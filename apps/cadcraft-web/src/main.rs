@@ -26,12 +26,13 @@ mod web {
     const CANVAS_ID: &str = "cadcraft_canvas";
     const LOADING_ID: &str = "cadcraft_loading";
 
-    /// The app, the files File > Open… and drag and drop read for it in the background, and the
-    /// page embedding it (`?host=parent`).
+    /// The app, background file reads, the embedding page (`?host=parent`), live reduced-motion
+    /// preference, and the optional shared cloud controller.
     struct Shell(
         CadApp,
         crate::upload::Inbox,
         Option<(crate::host::Bridge, crate::host::DirtyReport)>,
+        Option<web_sys::MediaQueryList>,
         #[cfg(feature = "icp-cloud")] sovereign_cloud_ui::Cloud,
     );
 
@@ -48,6 +49,7 @@ mod web {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.1.take_dropped(ctx);
             self.1.drain(&mut self.0);
+            self.0.system_animations = self.3.as_ref().map(|reduced| !reduced.matches());
             self.0.logic(ctx);
             publish_dirty_state(self.0.session.docs.iter().any(|d| d.is_dirty()));
             if let Some((bridge, reported)) = &self.2 {
@@ -69,7 +71,7 @@ mod web {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             self.0.ui(ui);
             #[cfg(feature = "icp-cloud")]
-            self.3.ui(ui.ctx(), &mut crate::cloud::Adapter(&mut self.0));
+            self.4.ui(ui.ctx(), &mut crate::cloud::Adapter(&mut self.0));
             publish_dirty_state(self.0.session.docs.iter().any(|d| d.is_dirty()));
             if let Some((bridge, reported)) = &self.2 {
                 bridge.report_dirty(&self.0, reported);
@@ -100,6 +102,11 @@ mod web {
         });
         cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
             cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
+        });
+        // AutoLISP's entget, entmake and entmod see entities as DXF groups.
+        cadcraft_engine::cmd::file::set_entity_codec(cadcraft_engine::cmd::file::EntityCodec {
+            groups: cadcraft_io::entity_groups,
+            entity: cadcraft_io::entity_from_groups,
         });
         // `?host=parent`: a same-origin page framing CADCraft (such as a Nextcloud app) opens
         // drawings in it and stores what it saves. Otherwise there is no file system here: saved
@@ -145,7 +152,9 @@ mod web {
                         if !crate::wants_cpu(&query())
                             && let Some(rs) = &cc.wgpu_render_state
                         {
-                            app.set_wgpu(rs);
+                            // eframe's web runner has no stencil buffer: clipped layout
+                            // viewports stay in the layout's display list.
+                            app.set_wgpu(rs, None);
                         }
                         if query().contains("sample") {
                             let _ = app.run("ui.sample", serde_json::json!({}));
@@ -163,6 +172,7 @@ mod web {
                             bridge.post_ready();
                             (bridge, crate::host::DirtyReport::default())
                         });
+                        let reduced_motion = web_sys::window().and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten());
                         #[cfg(feature = "icp-cloud")]
                         let cloud = {
                             let cloud = sovereign_cloud_ui::Cloud::new(sovereign_cloud_ui::AppSpec::CAD, cc.egui_ctx.clone());
@@ -174,6 +184,7 @@ mod web {
                             app,
                             inbox,
                             host,
+                            reduced_motion,
                             #[cfg(feature = "icp-cloud")]
                             cloud,
                         )))
